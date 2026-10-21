@@ -584,7 +584,8 @@ pub fn uu_app() -> Command {
                 .short('e')
                 .long("expiredate")
                 .value_name("EXPIRE_DATE")
-                .help("Set the account expiration date"),
+                .help("Set the account expiration date")
+                .allow_hyphen_values(true),
         )
         .arg(
             Arg::new(options::INACTIVE)
@@ -592,7 +593,8 @@ pub fn uu_app() -> Command {
                 .long("inactive")
                 .value_name("INACTIVE")
                 .value_parser(clap::value_parser!(i64))
-                .help("Days the password may stay expired before disabling the account"),
+                .help("Days the password may stay expired before disabling the account")
+                .allow_hyphen_values(true),
         )
         .arg(
             Arg::new(options::GID)
@@ -734,6 +736,18 @@ mod tests {
             uu_app()
                 .try_get_matches_from(["usermod", "-L", "-U", "u"])
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn test_negative_one_inactive_and_expiredate() {
+        let m = uu_app()
+            .try_get_matches_from(["usermod", "-f", "-1", "-e", "-1", "u"])
+            .expect("should parse -f -1 -e -1");
+        assert_eq!(m.get_one::<i64>(options::INACTIVE).copied(), Some(-1));
+        assert_eq!(
+            m.get_one::<String>(options::EXPIREDATE).map(String::as_str),
+            Some("-1")
         );
     }
 

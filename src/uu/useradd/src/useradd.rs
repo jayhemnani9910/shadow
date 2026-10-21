@@ -1062,14 +1062,16 @@ pub fn uu_app() -> Command {
                 .short('e')
                 .long("expiredate")
                 .value_name("EXPIRE_DATE")
-                .help("Account expiration date (YYYY-MM-DD)"),
+                .help("Account expiration date (YYYY-MM-DD)")
+                .allow_hyphen_values(true),
         )
         .arg(
             Arg::new(options::INACTIVE)
                 .short('f')
                 .long("inactive")
                 .value_name("INACTIVE")
-                .help("Days the password may stay expired before the account is disabled"),
+                .help("Days the password may stay expired before the account is disabled")
+                .allow_hyphen_values(true),
         )
         .arg(
             Arg::new(options::GID)
@@ -2374,6 +2376,22 @@ mod tests {
         let uid =
             determine_uid(&opts, &entries, &defs, uid_alloc::Scope::FilesOnly).expect("allocate");
         assert_eq!(uid, 9100);
+    }
+
+    #[test]
+    fn test_negative_one_inactive_and_expiredate() {
+        let m = uu_app()
+            .try_get_matches_from(["useradd", "-f", "-1", "-e", "-1", "testuser"])
+            .expect("should parse -f -1 -e -1");
+        assert_eq!(
+            m.get_one::<String>(options::INACTIVE).map(String::as_str),
+            Some("-1")
+        );
+        assert_eq!(
+            m.get_one::<String>(options::EXPIRE_DATE)
+                .map(String::as_str),
+            Some("-1")
+        );
     }
 
     #[test]
