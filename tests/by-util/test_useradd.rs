@@ -813,3 +813,21 @@ fn test_unusable_shadow_file_leaves_passwd_untouched() {
         "passwd was written although shadow could not be: {passwd:?}"
     );
 }
+
+#[test]
+fn test_invalid_name_exits_19() {
+    if crate::common::skip_unless_root() {
+        return;
+    }
+
+    let dir = setup_root_dir();
+    for name in ["bad:name", "1234"] {
+        let code = run_with_root(&dir, &["-M", "-N", name]);
+        assert_eq!(
+            code, 19,
+            "useradd(8): invalid user name should exit 19 ({name})"
+        );
+    }
+    let passwd = std::fs::read_to_string(dir.path().join("etc/passwd")).unwrap();
+    assert_eq!(passwd, "root:x:0:0:root:/root:/bin/bash\n");
+}
