@@ -105,6 +105,8 @@ enum UseraddError {
     CannotUpdateGroup(String),
     /// Exit 12 -- cannot create home directory.
     CannotCreateHome(String),
+    /// Exit 19 -- invalid user or group name.
+    BadName(String),
 }
 
 impl fmt::Display for UseraddError {
@@ -117,7 +119,8 @@ impl fmt::Display for UseraddError {
             | Self::GroupNotExist(msg)
             | Self::UsernameInUse(msg)
             | Self::CannotUpdateGroup(msg)
-            | Self::CannotCreateHome(msg) => f.write_str(msg),
+            | Self::CannotCreateHome(msg)
+            | Self::BadName(msg) => f.write_str(msg),
         }
     }
 }
@@ -135,6 +138,7 @@ impl UError for UseraddError {
             Self::UsernameInUse(_) => 9,
             Self::CannotUpdateGroup(_) => 10,
             Self::CannotCreateHome(_) => 12,
+            Self::BadName(_) => 19,
         }
     }
 }
@@ -545,8 +549,7 @@ fn parse_options(matches: &clap::ArgMatches) -> Result<UseraddOptions, UseraddEr
 #[allow(clippy::too_many_lines)]
 fn do_useradd(opts: &UseraddOptions) -> UResult<()> {
     // Step 1: Validate username.
-    validate::validate_username(&opts.login)
-        .map_err(|e| UseraddError::BadArgument(format!("{e}")))?;
+    validate::validate_username(&opts.login).map_err(|e| UseraddError::BadName(format!("{e}")))?;
 
     // Step 2: Block signals for the lock→write critical section only.
     // Dropped after file writes complete so home creation remains interruptible.
