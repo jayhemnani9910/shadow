@@ -810,7 +810,7 @@ fn determine_uid(
         Ok(requested_uid)
     } else {
         let (min, max) = uid_alloc::uid_range(defs, opts.system);
-        uid_alloc::next_uid(passwd_entries, min, max, scope)
+        uid_alloc::next_uid(passwd_entries, min, max, opts.system, scope)
             .map_err(|e| UseraddError::CannotUpdatePasswd(format!("{e}")))
     }
 }
@@ -850,7 +850,7 @@ fn determine_gid(
         // Allocate a GID. Prefer same as UID if available.
         let gid = if group_entries.iter().any(|g| g.gid == uid) {
             let (min, max) = uid_alloc::gid_range(defs, opts.system);
-            uid_alloc::next_gid(group_entries, min, max, scope)
+            uid_alloc::next_gid(group_entries, min, max, opts.system, scope)
                 .map_err(|e| UseraddError::CannotUpdateGroup(format!("{e}")))?
         } else {
             uid
@@ -1593,7 +1593,7 @@ mod tests {
         // Regular user allocation should start at UID_MIN (1000 default),
         // skip 1000 (taken), and give 1001.
         let (min, max) = uid_alloc::uid_range(&defs, false);
-        let uid = uid_alloc::next_uid(&entries, min, max, uid_alloc::Scope::FilesOnly)
+        let uid = uid_alloc::next_uid(&entries, min, max, false, uid_alloc::Scope::FilesOnly)
             .expect("should find UID");
         assert_eq!(uid, 1001);
     }
@@ -1613,9 +1613,9 @@ mod tests {
         let defs = LoginDefs::load(Path::new("/nonexistent")).expect("empty defs");
 
         let (min, max) = uid_alloc::uid_range(&defs, true);
-        let uid = uid_alloc::next_uid(&entries, min, max, uid_alloc::Scope::FilesOnly)
+        let uid = uid_alloc::next_uid(&entries, min, max, true, uid_alloc::Scope::FilesOnly)
             .expect("should find UID");
-        assert_eq!(uid, 101); // SYS_UID_MIN default
+        assert_eq!(uid, 999); // SYS_UID_MAX default, as shadow-utils hands out
     }
 
     // -----------------------------------------------------------------------
@@ -1756,6 +1756,7 @@ mod tests {
             passwd_file.entries(),
             uid_min,
             uid_max,
+            false,
             uid_alloc::Scope::FilesOnly,
         )
         .expect("uid");
