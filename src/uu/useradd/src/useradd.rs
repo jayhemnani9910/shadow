@@ -78,6 +78,7 @@ mod exit_codes {
     pub const USERNAME_IN_USE: i32 = 9;
     pub const CANNOT_UPDATE_GROUP: i32 = 10;
     pub const CANNOT_CREATE_HOME: i32 = 12;
+    pub const BAD_NAME: i32 = 19;
 }
 
 // ---------------------------------------------------------------------------
@@ -1686,6 +1687,10 @@ mod tests {
         assert_eq!(
             UseraddError::CannotCreateHome(String::new()).code(),
             exit_codes::CANNOT_CREATE_HOME
+        );
+        assert_eq!(
+            UseraddError::BadName(String::new()).code(),
+            exit_codes::BAD_NAME
         );
     }
 
