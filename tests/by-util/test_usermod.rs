@@ -528,6 +528,27 @@ fn test_expiredate_accepts_iso_date() {
 }
 
 #[test]
+fn test_negative_one_blanks_inactive_and_expiredate() {
+    if crate::common::skip_unless_root() {
+        return;
+    }
+
+    let dir = setup_prefix(
+        "alice:x:1000:1000:Alice:/home/alice:/bin/bash\n",
+        "alice:$6$h:19500:0:99999:7:30:19782:\n",
+        "alice:x:1000:\n",
+    );
+
+    let code = run_with_prefix(&dir, &["-e", "-1", "-f", "-1", "alice"]);
+    assert_eq!(code, 0, "-1 must be accepted for -e and -f");
+    assert_eq!(
+        read_shadow(&dir),
+        "alice:$6$h:19500:0:99999:7:::\n",
+        "-1 must blank the inactive and expire fields"
+    );
+}
+
+#[test]
 fn test_bad_expiredate_changes_nothing() {
     if crate::common::skip_unless_root() {
         return;
