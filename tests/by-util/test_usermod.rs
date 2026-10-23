@@ -210,6 +210,94 @@ fn test_change_uid() {
 }
 
 #[test]
+fn test_change_gid_regroups_home_files() {
+    use std::os::unix::fs::MetadataExt;
+
+    if crate::common::skip_unless_root() {
+        return;
+    }
+
+    let dir = setup_prefix(
+        "testuser:x:1000:1000:Test:/home/testuser:/bin/bash\n",
+        "testuser:$6$hash:19500:0:99999:7:::\n",
+        "testuser:x:1000:\ndev:x:2000:\n",
+    );
+    let home = dir.path().join("home/testuser");
+    std::fs::create_dir_all(home.join("sub")).expect("failed to create home");
+    for (name, uid, gid) in [
+        ("mine", 1000, 1000),
+        ("root-owned", 0, 1000),
+        ("other-group", 1000, 0),
+    ] {
+        std::fs::write(home.join(name), "").expect("failed to write file");
+        std::os::unix::fs::chown(home.join(name), Some(uid), Some(gid)).expect("chown failed");
+    }
+    std::os::unix::fs::chown(&home, Some(1000), Some(1000)).expect("chown failed");
+    std::os::unix::fs::chown(home.join("sub"), Some(1000), Some(1000)).expect("chown failed");
+
+    let code = run_with_prefix(&dir, &["-g", "dev", "testuser"]);
+    assert_eq!(code, 0, "changing the primary group should succeed");
+
+    let gid = |p: &str| {
+        std::fs::symlink_metadata(home.join(p))
+            .expect("stat failed")
+            .gid()
+    };
+    assert_eq!(gid(""), 2000, "home directory should move to the new group");
+    assert_eq!(
+        gid("sub"),
+        2000,
+        "subdirectory should move to the new group"
+    );
+    assert_eq!(gid("mine"), 2000, "file in the old group should move");
+    assert_eq!(
+        gid("root-owned"),
+        2000,
+        "file in the old group should move whatever its owner"
+    );
+    assert_eq!(
+        gid("other-group"),
+        0,
+        "file in another group should be left alone"
+    );
+}
+
+#[test]
+fn test_change_gid_skips_home_not_owned_by_user() {
+    use std::os::unix::fs::MetadataExt;
+
+    if crate::common::skip_unless_root() {
+        return;
+    }
+
+    let dir = setup_prefix(
+        "testuser:x:1000:1000:Test:/home/testuser:/bin/bash\n",
+        "testuser:$6$hash:19500:0:99999:7:::\n",
+        "testuser:x:1000:\ndev:x:2000:\n",
+    );
+    let home = dir.path().join("home/testuser");
+    std::fs::create_dir_all(&home).expect("failed to create home");
+    std::fs::write(home.join("mine"), "").expect("failed to write file");
+    std::os::unix::fs::chown(home.join("mine"), Some(1000), Some(1000)).expect("chown failed");
+    std::os::unix::fs::chown(&home, Some(0), Some(1000)).expect("chown failed");
+
+    let code = run_with_prefix(&dir, &["-g", "dev", "testuser"]);
+    assert_eq!(code, 0, "changing the primary group should succeed");
+
+    let gid = |p: &str| {
+        std::fs::symlink_metadata(home.join(p))
+            .expect("stat failed")
+            .gid()
+    };
+    assert_eq!(
+        gid(""),
+        1000,
+        "a home directory owned by root should be left alone"
+    );
+    assert_eq!(gid("mine"), 1000, "files under it should be left alone");
+}
+
+#[test]
 fn test_add_to_groups() {
     if crate::common::skip_unless_root() {
         return;
