@@ -8,8 +8,10 @@
 //!
 //! Drop-in replacement for GNU shadow-utils `usermod(8)`.
 
+use std::collections::HashMap;
 use std::fmt;
-use std::path::Path;
+use std::os::unix::fs::DirBuilderExt;
+use std::path::{Path, PathBuf};
 
 use clap::{Arg, ArgAction, Command};
 use uucore::error::{UError, UResult};
@@ -26,6 +28,7 @@ use shadow_core::{nscd, validate};
 mod options {
     pub const COMMENT: &str = "comment";
     pub const HOME: &str = "home";
+    pub const MOVE_HOME: &str = "move-home";
     pub const EXPIREDATE: &str = "expiredate";
     pub const INACTIVE: &str = "inactive";
     pub const GID: &str = "gid";
@@ -55,6 +58,7 @@ enum UsermodError {
     NameInUse(String),
     GroupNotFound(String),
     CantUpdateGroup(String),
+    CantMoveHome(String),
 }
 
 impl fmt::Display for UsermodError {
@@ -66,7 +70,8 @@ impl fmt::Display for UsermodError {
             | Self::UidInUse(msg)
             | Self::NameInUse(msg)
             | Self::GroupNotFound(msg)
-            | Self::CantUpdateGroup(msg) => f.write_str(msg),
+            | Self::CantUpdateGroup(msg)
+            | Self::CantMoveHome(msg) => f.write_str(msg),
         }
     }
 }
@@ -85,6 +90,8 @@ impl UError for UsermodError {
             Self::NameInUse(_) => 9,
             // usermod(8): 10 = can't update the group file.
             Self::CantUpdateGroup(_) => 10,
+            // usermod(8): 12 = unable to complete the move of the home directory.
+            Self::CantMoveHome(_) => 12,
         }
     }
 }
@@ -242,18 +249,11 @@ pub fn uumain(args: impl uucore::Args) -> UResult<()> {
         && !home_is_changing
         && !home_for_chown.is_empty()
     {
-        use std::os::unix::fs::MetadataExt;
-
-        // Like GNU, only a home directory the user owns is walked, and a
-        // symlinked home is not followed.
-        let home_path = root.resolve(&home_for_chown);
-        if std::fs::symlink_metadata(&home_path).is_ok_and(|m| m.is_dir() && m.uid() == old_uid) {
-            recursive_chown(
-                &home_path,
-                (old_uid, new_uid),
-                (old_primary_gid, new_primary_gid),
-            );
-        }
+        rechown_home(
+            &root.resolve(&home_for_chown),
+            (old_uid, new_uid),
+            (old_primary_gid, new_primary_gid),
+        );
     }
 
     // Shadow modifications.
@@ -436,6 +436,37 @@ pub fn uumain(args: impl uucore::Args) -> UResult<()> {
 
     apply_subid_changes(&root, login, &subid_changes)?;
 
+    // usermod(8) -m: the account files are already updated, as with GNU,
+    // when the move itself fails.
+    if matches.get_flag(options::MOVE_HOME)
+        && let Some(new_home) = matches.get_one::<String>(options::HOME)
+        && *new_home != home_for_chown
+        && !home_for_chown.is_empty()
+    {
+        let old_path = root.resolve(&home_for_chown);
+        let new_path = root.resolve(new_home);
+        if !std::fs::symlink_metadata(&old_path).is_ok_and(|m| m.is_dir()) {
+            uucore::show_warning!(
+                "The previous home directory ({home_for_chown}) does not exist or is inaccessible. Move cannot be completed."
+            );
+        } else if std::fs::symlink_metadata(&new_path).is_ok() {
+            return Err(UsermodError::CantMoveHome(format!("directory {new_home} exists")).into());
+        } else {
+            move_home(&old_path, &new_path).map_err(|_| {
+                UsermodError::CantMoveHome(format!(
+                    "cannot rename directory {home_for_chown} to {new_home}"
+                ))
+            })?;
+            if new_uid != old_uid || new_primary_gid != old_primary_gid {
+                rechown_home(
+                    &new_path,
+                    (old_uid, new_uid),
+                    (old_primary_gid, new_primary_gid),
+                );
+            }
+        }
+    }
+
     nscd::invalidate_cache("passwd");
     nscd::invalidate_cache("group");
 
@@ -520,6 +551,164 @@ fn apply_subid_changes(
     Ok(())
 }
 
+/// Re-own a home directory after a UID or primary group change. Like GNU,
+/// only a directory the user owns is walked, and a symlinked home is not
+/// followed.
+fn rechown_home(home: &Path, owner: (u32, u32), group: (u32, u32)) {
+    use std::os::unix::fs::MetadataExt;
+
+    if std::fs::symlink_metadata(home).is_ok_and(|m| m.is_dir() && m.uid() == owner.0) {
+        recursive_chown(home, owner, group);
+    }
+}
+
+/// Move a home directory: a rename on one filesystem, otherwise a copy that
+/// keeps owners, modes, times and hard links, followed by removal of the old
+/// tree. On a failed copy the partial new tree is removed and the old one
+/// is left as it was. Like GNU, an old tree that cannot be fully removed
+/// only gets a warning.
+fn move_home(old: &Path, new: &Path) -> std::io::Result<()> {
+    use rustix::fs::{Mode, OFlags};
+
+    match std::fs::rename(old, new) {
+        Err(e) if e.kind() == std::io::ErrorKind::CrossesDevices => {
+            let src = std::fs::File::from(rustix::fs::openat(
+                rustix::fs::CWD,
+                old,
+                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                Mode::empty(),
+            )?);
+            // Root-owned and 0700 until copy_tree gives it the old home's
+            // attributes last, so the user cannot reach the copy meanwhile.
+            std::fs::DirBuilder::new().mode(0o700).create(new)?;
+            if let Err(e) = copy_tree(&src, new, &mut HashMap::new()) {
+                let _ = std::fs::remove_dir_all(new);
+                return Err(e);
+            }
+            if std::fs::remove_dir_all(old).is_err() {
+                uucore::show_warning!(
+                    "failed to completely remove old home directory {}",
+                    old.display()
+                );
+            }
+            Ok(())
+        }
+        result => result,
+    }
+}
+
+/// Copy the directory open as `src` into the existing directory `dst`, then
+/// give `dst` the attributes of `src`. `links` maps the (device, inode) of a
+/// multiply linked source file to its first copy.
+///
+/// The user owns the source tree and can swap any entry for a symlink while
+/// it is copied, so every entry is opened relative to its directory with
+/// `O_NOFOLLOW`, and the attributes copied are those of what was opened.
+fn copy_tree(
+    src: &std::fs::File,
+    dst: &Path,
+    links: &mut HashMap<(u64, u64), PathBuf>,
+) -> std::io::Result<()> {
+    use rustix::fs::{Mode, OFlags};
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt};
+
+    let open = |name: &std::ffi::CStr, flags: OFlags| -> std::io::Result<std::fs::File> {
+        let fd = rustix::fs::openat(
+            src,
+            name,
+            flags | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )?;
+        Ok(std::fs::File::from(fd))
+    };
+    for entry in rustix::fs::Dir::read_from(src)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        if name == c"." || name == c".." {
+            continue;
+        }
+        let to = dst.join(std::ffi::OsStr::from_bytes(name.to_bytes()));
+        let handle = open(name, OFlags::PATH)?;
+        let meta = handle.metadata()?;
+        let kind = meta.file_type();
+        if kind.is_dir() {
+            let dir = open(name, OFlags::RDONLY | OFlags::DIRECTORY)?;
+            std::fs::DirBuilder::new().mode(0o700).create(&to)?;
+            copy_tree(&dir, &to, links)?;
+            continue;
+        }
+        let id = (meta.dev(), meta.ino());
+        if meta.nlink() > 1
+            && let Some(first) = links.get(&id)
+        {
+            std::fs::hard_link(first, &to)?;
+            continue;
+        }
+        let meta = if kind.is_symlink() {
+            let target = rustix::fs::readlinkat(&handle, c"", Vec::new())?;
+            std::os::unix::fs::symlink(std::ffi::OsStr::from_bytes(target.to_bytes()), &to)?;
+            meta
+        } else if kind.is_file() {
+            let mut reader = open(name, OFlags::RDONLY)?;
+            let opened = reader.metadata()?;
+            if !opened.is_file() {
+                return Err(std::io::ErrorKind::InvalidData.into());
+            }
+            let mut writer = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&to)?;
+            std::io::copy(&mut reader, &mut writer)?;
+            opened
+        } else if kind.is_fifo() || kind.is_char_device() || kind.is_block_device() {
+            rustix::fs::mknodat(
+                rustix::fs::CWD,
+                &to,
+                rustix::fs::FileType::from_raw_mode(meta.mode()),
+                Mode::from_raw_mode(0o600),
+                meta.rdev(),
+            )?;
+            meta
+        } else {
+            // Sockets belong to a running process and cannot be copied.
+            continue;
+        };
+        if meta.nlink() > 1 {
+            links.insert(id, to.clone());
+        }
+        copy_attributes(&to, &meta)?;
+    }
+    // Last, so that copying the entries does not change the times.
+    copy_attributes(dst, &src.metadata()?)
+}
+
+/// Give `path` the owner, mode and times in `meta`. The mode is set after the
+/// owner, since chown(2) clears the set-user-ID and set-group-ID bits.
+fn copy_attributes(path: &Path, meta: &std::fs::Metadata) -> std::io::Result<()> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    std::os::unix::fs::lchown(path, Some(meta.uid()), Some(meta.gid()))?;
+    if !meta.file_type().is_symlink() {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(meta.mode() & 0o7777))?;
+    }
+    let time = |sec: i64, nsec: i64| rustix::fs::Timespec {
+        tv_sec: sec,
+        tv_nsec: nsec,
+    };
+    rustix::fs::utimensat(
+        rustix::fs::CWD,
+        path,
+        &rustix::fs::Timestamps {
+            last_access: time(meta.atime(), meta.atime_nsec()),
+            last_modification: time(meta.mtime(), meta.mtime_nsec()),
+        },
+        rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
+    )?;
+    Ok(())
+}
+
 /// Recursively chown all files and directories under `path`: those owned by
 /// the old UID get the new UID, and those whose group is the old GID get the
 /// new GID. Other owners and groups are left untouched.
@@ -596,6 +785,14 @@ pub fn uu_app() -> Command {
                 .long("home")
                 .value_name("HOME_DIR")
                 .help("Replace the home directory path"),
+        )
+        .arg(
+            Arg::new(options::MOVE_HOME)
+                .short('m')
+                .long("move-home")
+                .help("Move the contents of the home directory to the new location (use only with -d)")
+                .requires(options::HOME)
+                .action(ArgAction::SetTrue),
         )
         .arg(
             Arg::new(options::EXPIREDATE)
@@ -779,6 +976,71 @@ mod tests {
             m.get_one::<String>(options::GROUPS).map(String::as_str),
             Some("sudo,docker")
         );
+    }
+
+    #[test]
+    fn test_copy_tree_keeps_links_modes_and_times() {
+        use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
+
+        let src = tempfile::tempdir().expect("tempdir");
+        let dst = tempfile::tempdir().expect("tempdir");
+        let s = src.path();
+        std::fs::create_dir(s.join("d")).expect("mkdir");
+        std::fs::write(s.join("d/f"), "data").expect("write");
+        std::fs::set_permissions(s.join("d/f"), std::fs::Permissions::from_mode(0o640))
+            .expect("chmod");
+        std::fs::hard_link(s.join("d/f"), s.join("hard")).expect("link");
+        std::os::unix::fs::symlink("d/f", s.join("sym")).expect("symlink");
+        rustix::fs::mknodat(
+            rustix::fs::CWD,
+            s.join("fifo"),
+            rustix::fs::FileType::Fifo,
+            rustix::fs::Mode::from_raw_mode(0o600),
+            0,
+        )
+        .expect("mkfifo");
+        let old = rustix::fs::Timestamps {
+            last_access: rustix::fs::Timespec {
+                tv_sec: 1_000_000_000,
+                tv_nsec: 0,
+            },
+            last_modification: rustix::fs::Timespec {
+                tv_sec: 1_000_000_000,
+                tv_nsec: 0,
+            },
+        };
+        for p in ["d/f", "d"] {
+            rustix::fs::utimensat(
+                rustix::fs::CWD,
+                s.join(p),
+                &old,
+                rustix::fs::AtFlags::empty(),
+            )
+            .expect("utimensat");
+        }
+
+        let src_dir = std::fs::File::open(s).expect("open");
+        copy_tree(&src_dir, dst.path(), &mut HashMap::new()).expect("copy_tree");
+
+        let d = dst.path();
+        let stat = |p: &str| std::fs::symlink_metadata(d.join(p)).expect("stat");
+        assert_eq!(
+            std::fs::read_to_string(d.join("d/f")).expect("read"),
+            "data"
+        );
+        assert_eq!(stat("d/f").mode() & 0o7777, 0o640);
+        assert_eq!(stat("d/f").mtime(), 1_000_000_000);
+        assert_eq!(stat("d").mtime(), 1_000_000_000);
+        assert_eq!(
+            stat("hard").ino(),
+            stat("d/f").ino(),
+            "hard link should stay a link"
+        );
+        assert_eq!(
+            std::fs::read_link(d.join("sym")).expect("readlink"),
+            Path::new("d/f")
+        );
+        assert!(stat("fifo").file_type().is_fifo());
     }
 
     fn skip_unless_root() -> bool {
