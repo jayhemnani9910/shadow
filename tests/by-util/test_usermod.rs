@@ -384,6 +384,62 @@ fn test_home_not_owned_by_user_is_left_alone() {
 }
 
 #[test]
+fn test_move_home_requires_home() {
+    let dir = setup_prefix(
+        "testuser:x:1000:1000:Test:/home/testuser:/bin/bash\n",
+        "testuser:$6$hash:19500:0:99999:7:::\n",
+        "testuser:x:1000:\n",
+    );
+    assert_eq!(run_with_prefix(&dir, &["-m", "testuser"]), 2);
+}
+
+#[test]
+fn test_move_home() {
+    if crate::common::skip_unless_root() {
+        return;
+    }
+
+    let dir = setup_prefix(
+        "testuser:x:1000:1000:Test:/home/testuser:/bin/bash\n",
+        "testuser:$6$hash:19500:0:99999:7:::\n",
+        "testuser:x:1000:\n",
+    );
+    let old = dir.path().join("home/testuser");
+    std::fs::create_dir_all(old.join("sub")).expect("failed to create home");
+    std::fs::write(old.join("sub/f"), "data").expect("failed to write file");
+
+    let code = run_with_prefix(&dir, &["-d", "/home/moved", "-m", "testuser"]);
+    assert_eq!(code, 0, "moving the home directory should succeed");
+
+    assert!(!old.exists(), "old home should be gone");
+    let moved = dir.path().join("home/moved/sub/f");
+    assert_eq!(std::fs::read_to_string(moved).expect("moved file"), "data");
+    assert!(read_passwd(&dir).contains(":/home/moved:"));
+}
+
+#[test]
+fn test_move_home_onto_existing_directory_fails() {
+    if crate::common::skip_unless_root() {
+        return;
+    }
+
+    let dir = setup_prefix(
+        "testuser:x:1000:1000:Test:/home/testuser:/bin/bash\n",
+        "testuser:$6$hash:19500:0:99999:7:::\n",
+        "testuser:x:1000:\n",
+    );
+    std::fs::create_dir_all(dir.path().join("home/testuser")).expect("failed to create home");
+    std::fs::create_dir_all(dir.path().join("home/taken")).expect("failed to create dir");
+
+    let code = run_with_prefix(&dir, &["-d", "/home/taken", "-m", "testuser"]);
+    assert_eq!(code, 12, "a move onto an existing directory should exit 12");
+    assert!(
+        dir.path().join("home/testuser").is_dir(),
+        "old home should stay"
+    );
+}
+
+#[test]
 fn test_add_to_groups() {
     if crate::common::skip_unless_root() {
         return;
