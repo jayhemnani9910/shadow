@@ -266,19 +266,7 @@ pub fn uumain(args: impl uucore::Args) -> UResult<()> {
     // When a mutation flag and aging flags are both present, apply both in a
     // single `mutate_shadow` call so neither set of changes is lost.
     if has_mutation || has_aging {
-        let action = if has_lock {
-            "Locking password"
-        } else if has_unlock {
-            "Unlocking password"
-        } else if has_delete {
-            "Removing password"
-        } else if has_expire {
-            "Expiring password"
-        } else {
-            "Updating aging information"
-        };
-
-        return mutate_shadow(&root, &target_user, action, quiet, |entry| {
+        return mutate_shadow(&root, &target_user, quiet, |entry| {
             // Apply the mutation operation.
             if has_lock {
                 entry.lock();
@@ -676,13 +664,7 @@ fn open_error(e: shadow_core::error::ShadowError, path: &Path) -> PasswdError {
     }
 }
 
-fn mutate_shadow<F>(
-    root: &SysRoot,
-    username: &str,
-    action: &str,
-    quiet: bool,
-    mutate: F,
-) -> UResult<()>
+fn mutate_shadow<F>(root: &SysRoot, username: &str, quiet: bool, mutate: F) -> UResult<()>
 where
     F: FnOnce(&mut ShadowEntry) -> Result<(), String>,
 {
@@ -718,8 +700,13 @@ where
         true,
     );
 
+    // GNU passwd reports every change it writes this way, on stdout.
     if !quiet {
-        uucore::show_error!("{action} for user {username}");
+        let _ = writeln!(
+            std::io::stdout().lock(),
+            "{}: password changed.",
+            uucore::util_name()
+        );
     }
     Ok(())
 }

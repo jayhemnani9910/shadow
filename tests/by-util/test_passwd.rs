@@ -199,6 +199,32 @@ fn test_quiet_no_action_message() {
 }
 
 #[test]
+fn test_change_reports_password_changed_on_stdout() {
+    if crate::common::skip_unless_root() {
+        return;
+    }
+    // GNU passwd prints "passwd: password changed." on stdout for every
+    // change it writes, and nothing with -q.
+    for (args, expected) in [
+        (&["-l", "testuser"][..], "password changed.\n"),
+        (&["-x", "90", "testuser"][..], "password changed.\n"),
+        (&["-q", "-e", "testuser"][..], ""),
+    ] {
+        let dir = setup_prefix("testuser:$6$hash:19500:0:99999:7:::\n");
+        let mut cmd = crate::common::tool("passwd");
+        cmd.arg("-P").arg(dir.path()).args(args);
+        let out = crate::common::run_cmd(&mut cmd);
+        out.assert_code(0);
+        assert!(
+            out.stdout.ends_with(expected) && out.stdout.is_empty() == expected.is_empty(),
+            "{args:?}: stdout {:?}",
+            out.stdout
+        );
+        assert_eq!(out.stderr, "", "{args:?}");
+    }
+}
+
+#[test]
 fn test_lock_and_aging_combined() {
     if crate::common::skip_unless_root() {
         return;
