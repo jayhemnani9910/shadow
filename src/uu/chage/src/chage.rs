@@ -28,6 +28,7 @@ mod options {
     pub const EXPIREDATE: &str = "expiredate";
     pub const INACTIVE: &str = "inactive";
     pub const LIST: &str = "list";
+    pub const ISO8601: &str = "iso8601";
     pub const MINDAYS: &str = "mindays";
     pub const MAXDAYS: &str = "maxdays";
     pub const ROOT: &str = "root";
@@ -188,7 +189,7 @@ pub fn uumain(args: impl uucore::Args) -> UResult<()> {
                 .into());
             }
         }
-        return cmd_list(&root, login);
+        return cmd_list(&root, login, matches.get_flag(options::ISO8601));
     }
 
     // All modification flags require root.
@@ -307,6 +308,13 @@ pub fn uu_app() -> Command {
                 .action(ArgAction::SetTrue),
         )
         .arg(
+            Arg::new(options::ISO8601)
+                .short('i')
+                .long("iso8601")
+                .help("use YYYY-MM-DD when printing dates")
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
             Arg::new(options::MINDAYS)
                 .short('m')
                 .long("mindays")
@@ -359,8 +367,8 @@ pub fn uu_app() -> Command {
 // Command implementations
 // ---------------------------------------------------------------------------
 
-/// `chage -l LOGIN` — display aging information.
-fn cmd_list(root: &SysRoot, login: &str) -> UResult<()> {
+/// `chage -l LOGIN` — display aging information, with `-i` in `YYYY-MM-DD`.
+fn cmd_list(root: &SysRoot, login: &str, iso: bool) -> UResult<()> {
     let shadow_path = root.shadow_path();
     let entries = shadow::read_shadow_file(&shadow_path).map_err(|e| {
         ChageError::ShadowNotFound(format!("Cannot open {}: {e}", shadow_path.display()))
@@ -371,7 +379,7 @@ fn cmd_list(root: &SysRoot, login: &str) -> UResult<()> {
         .find(|e| e.name == login)
         .ok_or_else(|| ChageError::UserNotFound(format!("user '{login}' does not exist")))?;
 
-    print_aging_info(entry);
+    print_aging_info(entry, iso);
     Ok(())
 }
 
@@ -383,13 +391,19 @@ fn cmd_list(root: &SysRoot, login: &str) -> UResult<()> {
 const MAX_AGE_NEVER: i64 = 10_000;
 
 /// Print the aging information to stdout in the GNU `chage -l` format.
-fn print_aging_info(entry: &ShadowEntry) {
+fn print_aging_info(entry: &ShadowEntry, iso: bool) {
     let mut out = std::io::stdout().lock();
-    write_aging_info(entry, &mut out);
+    write_aging_info(entry, &mut out, iso);
 }
 
 /// Render the aging information, so the exact output can be asserted on.
-fn write_aging_info<W: Write>(entry: &ShadowEntry, out: &mut W) {
+/// `iso` prints the dates as `YYYY-MM-DD` (`-i`).
+fn write_aging_info<W: Write>(entry: &ShadowEntry, out: &mut W, iso: bool) {
+    let (format, format_sum): (FormatDate, FormatDateSum) = if iso {
+        (date::format_iso, date::format_iso_sum)
+    } else {
+        (date::format_human, date::format_human_sum)
+    };
     // A last-change day of 0 is the "expired, must change at next login" marker
     // that `passwd -e` writes. It is not a date, and it makes the two derived
     // dates meaningless too, so all three lines say so.
@@ -399,25 +413,27 @@ fn write_aging_info<W: Write>(entry: &ShadowEntry, out: &mut W) {
     let last_change = if must_change {
         MUST_CHANGE.to_string()
     } else {
-        entry
-            .last_change
-            .and_then(date::format_human)
-            .unwrap_or_else(never)
+        entry.last_change.and_then(format).unwrap_or_else(never)
     };
     let password_expires = if must_change {
         MUST_CHANGE.to_string()
     } else {
-        expiry_display(entry.last_change, entry.max_age)
+        expiry_display(entry.last_change, entry.max_age, format_sum)
     };
     let password_inactive = if must_change {
         MUST_CHANGE.to_string()
     } else {
-        inactive_display(entry.last_change, entry.max_age, entry.inactive_days)
+        inactive_display(
+            entry.last_change,
+            entry.max_age,
+            entry.inactive_days,
+            format_sum,
+        )
     };
     let account_expires = entry
         .expire_date
         .filter(|d| *d >= 0)
-        .and_then(date::format_human)
+        .and_then(format)
         .unwrap_or_else(never);
 
     let field = |v: Option<i64>| v.map_or_else(|| "-1".to_string(), |v| v.to_string());
@@ -443,15 +459,22 @@ fn write_aging_info<W: Write>(entry: &ShadowEntry, out: &mut W) {
     );
 }
 
+/// Formats a day count as a date (`format_human` or `format_iso`).
+type FormatDate = fn(i64) -> Option<String>;
+/// Formats a sum of day counts as a date.
+type FormatDateSum = fn(&[i64]) -> Option<String>;
+
 /// What `chage -l` prints in place of a date for an expired password.
 const MUST_CHANGE: &str = "password must be changed";
 
 /// The date the password expires, or `never`.
-fn expiry_display(last_change: Option<i64>, max_age: Option<i64>) -> String {
+fn expiry_display(
+    last_change: Option<i64>,
+    max_age: Option<i64>,
+    format_sum: FormatDateSum,
+) -> String {
     match (last_change, max_age) {
-        (Some(lc), Some(max)) if (0..MAX_AGE_NEVER).contains(&max) => {
-            date::format_human_sum(&[lc, max])
-        }
+        (Some(lc), Some(max)) if (0..MAX_AGE_NEVER).contains(&max) => format_sum(&[lc, max]),
         _ => None,
     }
     .unwrap_or_else(|| "never".to_string())
@@ -462,12 +485,13 @@ fn inactive_display(
     last_change: Option<i64>,
     max_age: Option<i64>,
     inactive_days: Option<i64>,
+    format_sum: FormatDateSum,
 ) -> String {
     match (last_change, max_age, inactive_days) {
         (Some(lc), Some(max), Some(inactive))
             if (0..MAX_AGE_NEVER).contains(&max) && inactive >= 0 =>
         {
-            date::format_human_sum(&[lc, max, inactive])
+            format_sum(&[lc, max, inactive])
         }
         _ => None,
     }
@@ -711,7 +735,7 @@ mod tests {
 
     fn aging_lines(entry: &ShadowEntry) -> Vec<String> {
         let mut out = Vec::new();
-        write_aging_info(entry, &mut out);
+        write_aging_info(entry, &mut out, false);
         String::from_utf8(out)
             .expect("utf-8")
             .lines()
@@ -734,6 +758,38 @@ mod tests {
             expire_date: None,
             reserved: String::new(),
         }
+    }
+
+    #[test]
+    fn test_aging_output_iso8601() {
+        // `chage -l -i`, checked against GNU shadow 4.17 for the same entry.
+        let entry = ShadowEntry {
+            inactive_days: Some(5),
+            expire_date: Some(shadow_core::date::days_from_civil(2030, 12, 31)),
+            ..entry_with(
+                Some(shadow_core::date::days_from_civil(2020, 1, 1)),
+                Some(30),
+            )
+        };
+        let mut out = Vec::new();
+        write_aging_info(&entry, &mut out, true);
+        let values: Vec<String> = String::from_utf8(out)
+            .expect("utf-8")
+            .lines()
+            .map(|l| l.rsplit_once(": ").map_or("", |(_, v)| v).to_string())
+            .collect();
+        assert_eq!(
+            values,
+            [
+                "2020-01-01",
+                "2020-01-31",
+                "2020-02-05",
+                "2030-12-31",
+                "0",
+                "30",
+                "7"
+            ]
+        );
     }
 
     #[test]
