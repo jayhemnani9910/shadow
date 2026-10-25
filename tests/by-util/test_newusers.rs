@@ -393,6 +393,24 @@ fn test_system_accounts_come_from_the_system_range() {
     );
 }
 
+/// System accounts take IDs from the top of the system range down, as
+/// shadow-utils does.
+#[test]
+fn test_system_accounts_count_down_from_sys_uid_max() {
+    if skip_unless_root() {
+        return;
+    }
+    let dir = prefix();
+    std::fs::write(
+        dir.path().join("etc").join("login.defs"),
+        "SYS_UID_MIN 200\nSYS_UID_MAX 299\nSYS_GID_MIN 200\nSYS_GID_MAX 299\nENCRYPT_METHOD SHA512\n",
+    )
+    .expect("login.defs");
+    newusers(&dir, &["-r"], "sysa:secret:::::\nsysb:secret:::::\n").assert_code(0);
+    assert_eq!(record(&dir, "passwd", "sysa")[2], "299");
+    assert_eq!(record(&dir, "passwd", "sysb")[2], "298");
+}
+
 #[test]
 fn test_help_exits_zero() {
     let dir = prefix();

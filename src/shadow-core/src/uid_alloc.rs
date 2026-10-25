@@ -7,9 +7,8 @@
 //!
 //! Finds the next available UID or GID by scanning existing entries: one past
 //! the highest in use for regular accounts, one below the lowest in use for
-//! system accounts. Range
-//! boundaries come from `login.defs` keys (`UID_MIN`, `UID_MAX`,
-//! `SYS_UID_MIN`, `SYS_UID_MAX`, and the GID equivalents).
+//! system accounts. Range boundaries come from `login.defs` keys (`UID_MIN`,
+//! `UID_MAX`, `SYS_UID_MIN`, `SYS_UID_MAX`, and the GID equivalents).
 //!
 //! Default ranges follow the Debian/upstream convention:
 //! - Regular users: 1000 -- 60000
@@ -445,6 +444,15 @@ mod tests {
         assert_eq!(
             next_free_checked(&used, 1000, 1005, false, &directory),
             Some(1003)
+        );
+
+        // System IDs count down, so the directory's 999 and 998 are skipped
+        // the other way.
+        let used: HashSet<u32> = HashSet::new();
+        let directory = |id: u32| id == 999 || id == 998;
+        assert_eq!(
+            next_free_checked(&used, 101, 999, true, &directory),
+            Some(997)
         );
     }
 
