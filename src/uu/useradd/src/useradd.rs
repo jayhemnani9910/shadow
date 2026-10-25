@@ -1409,7 +1409,10 @@ mod tests {
     #[test]
     fn test_clap_user_group_conflicts_with_gid() {
         let result = uu_app().try_get_matches_from(["useradd", "-U", "-g", "100", "user"]);
-        assert!(result.is_err());
+        assert_eq!(
+            result.unwrap_err().kind(),
+            clap::error::ErrorKind::ArgumentConflict
+        );
     }
 
     #[test]
