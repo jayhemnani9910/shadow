@@ -150,6 +150,16 @@ pub fn format_human(days: i64) -> Option<String> {
     Some(format!("{name} {day:02}, {year}"))
 }
 
+/// Format `days` since the epoch as `YYYY-MM-DD`, the way `chage -l -i`
+/// prints a date.
+///
+/// `None` for a value that is not a representable date.
+#[must_use]
+pub fn format_iso(days: i64) -> Option<String> {
+    let (year, month, day) = civil_from_days(days)?;
+    Some(format!("{year:04}-{month:02}-{day:02}"))
+}
+
 /// Format the sum of `days` as a date, or `None` if any term overflows or the
 /// total is not a representable date.
 ///
@@ -158,11 +168,21 @@ pub fn format_human(days: i64) -> Option<String> {
 /// ones, so the addition is checked here once for every caller.
 #[must_use]
 pub fn format_human_sum(days: &[i64]) -> Option<String> {
+    format_human(checked_sum(days)?)
+}
+
+/// [`format_human_sum`] with the `YYYY-MM-DD` form of [`format_iso`].
+#[must_use]
+pub fn format_iso_sum(days: &[i64]) -> Option<String> {
+    format_iso(checked_sum(days)?)
+}
+
+fn checked_sum(days: &[i64]) -> Option<i64> {
     let mut total: i64 = 0;
     for d in days {
         total = total.checked_add(*d)?;
     }
-    format_human(total)
+    Some(total)
 }
 
 #[cfg(test)]
