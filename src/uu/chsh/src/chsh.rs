@@ -317,7 +317,6 @@ pub fn uumain(args: impl uucore::Args) -> UResult<()> {
         Ok(())
     })?;
 
-    uucore::show_error!("shell changed for '{target_user}'");
     Ok(())
 }
 

@@ -412,7 +412,6 @@ pub fn uumain(args: impl uucore::Args) -> UResult<()> {
         Ok(())
     })?;
 
-    uucore::show_error!("changed user '{target_user}' information");
     Ok(())
 }
 

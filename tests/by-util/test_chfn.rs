@@ -78,3 +78,34 @@ fn test_no_flags_exits_error() {
     let code = run(&["chfn", "someuser"]);
     assert_eq!(code, 1, "no flags should exit 1");
 }
+
+#[test]
+fn test_chfn_success_prints_nothing() {
+    if crate::common::skip_unless_root() {
+        return;
+    }
+    // GNU chfn prints nothing when the change succeeds.
+    let dir = tempfile::tempdir().expect("failed to create temp dir");
+    let etc = dir.path().join("etc");
+    std::fs::create_dir_all(&etc).expect("failed to create etc dir");
+    std::fs::write(
+        etc.join("passwd"),
+        "root:x:0:0:root:/root:/bin/bash\ntestuser:x:1000:1000:Old Name,,,:/home/testuser:/bin/sh\n",
+    )
+    .expect("failed to write passwd");
+    std::fs::write(etc.join("shells"), "/bin/sh\n/bin/bash\n").expect("failed to write shells");
+
+    let mut cmd = crate::common::tool("chfn");
+    cmd.arg("-R")
+        .arg(dir.path())
+        .args(["-f", "New Name", "testuser"]);
+    let out = crate::common::run_cmd(&mut cmd);
+    out.assert_code(0);
+    assert_eq!(out.stdout, "");
+    assert_eq!(out.stderr, "");
+    let passwd = std::fs::read_to_string(etc.join("passwd")).expect("failed to read passwd");
+    assert!(
+        passwd.contains(":New Name,"),
+        "passwd not updated:\n{passwd}"
+    );
+}
