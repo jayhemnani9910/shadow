@@ -208,13 +208,13 @@ fn run_checks(opts: &PwckOptions) -> UResult<()> {
     // the entries that parsed, so writing would silently drop every line pwck
     // just reported as invalid. Report the errors and stop.
     if errors > 0 {
+        // Like GNU pwck, say so on stdout, even with -q
+        let _ = writeln!(std::io::stdout(), "{}: no changes", uucore::util_name());
         return Err(PwckError::BadEntry(String::new()).into());
     }
 
     if opts.sort {
         sort_and_write(&opts.passwd_path, &opts.shadow_path, opts.read_only)?;
-    } else {
-        uucore::show_error!("no changes");
     }
 
     Ok(())
@@ -468,29 +468,6 @@ fn check_passwd_entries(
         if !group_entries.is_empty() && !group_gids.contains(&entry.gid) {
             uucore::show_error!("user '{}': no group {}", entry.name, entry.gid);
             errors += 1;
-        }
-
-        // Check 4b: UID/GID range validation (advisory warning only).
-        if !quiet {
-            const MAX_SYSTEM_ID: u32 = 60_000;
-            if entry.uid > MAX_SYSTEM_ID {
-                uucore::show_warning!(
-                    "user '{}': UID {} is outside the normal range (> {})",
-                    entry.name,
-                    entry.uid,
-                    MAX_SYSTEM_ID
-                );
-                warnings += 1;
-            }
-            if entry.gid > MAX_SYSTEM_ID {
-                uucore::show_warning!(
-                    "user '{}': GID {} is outside the normal range (> {})",
-                    entry.name,
-                    entry.gid,
-                    MAX_SYSTEM_ID
-                );
-                warnings += 1;
-            }
         }
 
         // Checks 5 and 6: the home directory and the login shell.
