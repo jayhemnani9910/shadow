@@ -113,6 +113,19 @@ fn test_create_group_with_gid() {
 }
 
 #[test]
+fn test_reserved_gid_fails() {
+    if crate::common::skip_unless_root() {
+        return;
+    }
+
+    let dir = setup_prefix("root:x:0:\n", "");
+
+    let code = run_with_prefix(&dir, &["-g", "4294967295", "badgrp"]);
+    assert_eq!(code, 3, "(gid_t)-1 must be a bad argument");
+    assert!(!read_group(&dir).contains("badgrp:"), "nothing written");
+}
+
+#[test]
 fn test_create_group_system() {
     if crate::common::skip_unless_root() {
         return;

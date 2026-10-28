@@ -209,6 +209,26 @@ fn test_change_uid() {
     );
 }
 
+#[test]
+fn test_reserved_uid_fails() {
+    if crate::common::skip_unless_root() {
+        return;
+    }
+
+    let dir = setup_prefix(
+        "testuser:x:1000:1000:Test:/home/testuser:/bin/bash\n",
+        "testuser:$6$hash:19500:0:99999:7:::\n",
+        "testuser:x:1000:\n",
+    );
+
+    let code = run_with_prefix(&dir, &["-u", "4294967295", "testuser"]);
+    assert_eq!(code, 3, "(uid_t)-1 must be a bad argument");
+    assert!(
+        read_passwd(&dir).contains("testuser:x:1000:"),
+        "UID unchanged"
+    );
+}
+
 /// Owner and group of `path`, without following a symlink.
 fn owner_of(path: &std::path::Path) -> (u32, u32) {
     use std::os::unix::fs::MetadataExt;

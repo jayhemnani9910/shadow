@@ -183,6 +183,10 @@ pub fn uumain(args: impl uucore::Args) -> UResult<()> {
 
     // Check UID collision before mutating.
     if let Some(&uid) = matches.get_one::<u32>(options::UID) {
+        // u32::MAX is (uid_t)-1, the "no change" sentinel of chown/setresuid.
+        if uid == u32::MAX {
+            return Err(UsermodError::BadArgument(format!("invalid UID '{uid}'")).into());
+        }
         if entries.iter().any(|e| e.uid == uid && e.name != *login) {
             return Err(UsermodError::UidInUse(format!("UID {uid} already in use")).into());
         }
