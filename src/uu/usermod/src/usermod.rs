@@ -273,7 +273,7 @@ pub fn uumain(args: impl uucore::Args) -> UResult<()> {
         .get_flag(options::MOVE_HOME)
         .then(|| matches.get_one::<String>(options::HOME))
         .flatten()
-        .filter(|new_home| **new_home != old_home && !old_home.is_empty());
+        .filter(|new_home| **new_home != old_home);
     let home_chown = if move_to.is_none()
         && (new_uid != old_uid || new_primary_gid != old_primary_gid)
         && !home_for_chown.is_empty()
@@ -560,30 +560,49 @@ fn apply_subid_changes(
     Ok(())
 }
 
-/// Do what `-m` asks once the account files are written: move the home unless
-/// it is missing or the new path is taken, then re-own it at its new path.
+/// Do what `-m` asks once the account files are written: move the home, then
+/// re-own it at its new path. Nothing is re-owned if the move does not happen.
+///
+/// The paths are looked at through a symlink, like upstream. A home that is a
+/// symlink to a directory is renamed as a link, and then counts as a home that
+/// cannot be re-owned. Across filesystems it cannot be opened, so it stays.
 fn move_and_reown_home(
     root: &SysRoot,
     (old_home, new_home): (&str, &str),
     owner: (u32, u32),
     group: (u32, u32),
 ) -> Result<(), UsermodError> {
+    use rustix::fs::FileType;
+
     let old_path = root.resolve(old_home);
     let new_path = root.resolve(new_home);
-    if !std::fs::symlink_metadata(&old_path).is_ok_and(|m| m.is_dir()) {
-        uucore::show_warning!(
-            "The previous home directory ({old_home}) does not exist or is inaccessible. Move cannot be completed."
-        );
-        return Ok(());
-    }
-    if std::fs::symlink_metadata(&new_path).is_ok() {
+    if rustix::fs::stat(&new_path).is_ok() {
         return Err(UsermodError::CantMoveHome(format!(
             "directory {new_home} exists"
         )));
     }
+    // An empty home resolves to the root of the prefix, which is not a home.
+    let old_stat = (!old_home.is_empty())
+        .then(|| rustix::fs::stat(&old_path).ok())
+        .flatten();
+    let Some(old_stat) = old_stat else {
+        uucore::show_warning!(
+            "The previous home directory ({old_home}) does not exist or is inaccessible. Move cannot be completed."
+        );
+        return Ok(());
+    };
+    if FileType::from_raw_mode(old_stat.st_mode) != FileType::Directory {
+        return Err(UsermodError::CantMoveHome(format!(
+            "The previous home directory ({old_home}) was not a directory. It is not removed and no home directories are created."
+        )));
+    }
+    let is_symlink = std::fs::symlink_metadata(&old_path).is_ok_and(|m| m.is_symlink());
     move_home(&old_path, &new_path).map_err(|_| {
         UsermodError::CantMoveHome(format!("cannot rename directory {old_home} to {new_home}"))
     })?;
+    if is_symlink {
+        return Err(cant_chown_home());
+    }
     if owner.0 != owner.1 || group.0 != group.1 {
         rechown_home(&new_path, owner, group)?;
     }
