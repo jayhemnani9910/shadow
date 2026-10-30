@@ -429,3 +429,49 @@ fn test_relative_home_and_shell_are_reported() {
     );
     assert_eq!(pwck_rooted(&dir, &["-r"]).code, 2);
 }
+
+#[test]
+fn test_clean_files_print_nothing() {
+    if crate::common::skip_unless_root() {
+        return;
+    }
+
+    // nobody/nogroup use 65534 on Debian and Ubuntu; GNU pwck does not flag it.
+    let dir = setup_root(
+        "root:x:0:0:root:/root:/bin/bash\nnobody:x:65534:65534:nobody:/nonexistent:/usr/sbin/nologin\n",
+        "root:$6$hash:19000:0:99999:7:::\nnobody:*:19000:0:99999:7:::\n",
+        "root:x:0:\nnogroup:x:65534:\n",
+    );
+    std::fs::create_dir_all(dir.path().join("root")).expect("mkdir root");
+
+    let out = pwck_rooted(&dir, &["-r", "/etc/passwd", "/etc/shadow"]);
+    assert_eq!(
+        (out.code, out.stdout.as_str(), out.stderr.as_str()),
+        (0, "", "")
+    );
+}
+
+#[test]
+fn test_problems_end_with_no_changes_even_with_quiet() {
+    if crate::common::skip_unless_root() {
+        return;
+    }
+
+    let dir = setup_root(
+        "root:x:0:0:root:/root:/bin/bash\nalice:x:1000:1000::/home/alice:/bin/bash\n",
+        "root:$6$hash:19000:0:99999:7:::\n",
+        "root:x:0:\nusers:x:1000:\n",
+    );
+    std::fs::create_dir_all(dir.path().join("root")).expect("mkdir root");
+    std::fs::create_dir_all(dir.path().join("home/alice")).expect("mkdir alice home");
+
+    for args in [&["-r"][..], &["-r", "-q"]] {
+        let out = pwck_rooted(&dir, args);
+        assert_eq!(out.code, 2);
+        assert!(
+            out.stdout.ends_with(": no changes\n"),
+            "stdout: {:?}",
+            out.stdout
+        );
+    }
+}
