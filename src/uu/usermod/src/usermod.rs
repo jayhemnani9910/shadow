@@ -31,6 +31,7 @@ mod options {
     pub const GID: &str = "gid";
     pub const GROUPS: &str = "groups";
     pub const APPEND: &str = "append";
+    pub const REMOVE: &str = "remove";
     pub const LOCK: &str = "lock";
     pub const UNLOCK: &str = "unlock";
     pub const LOGIN: &str = "login";
@@ -392,17 +393,20 @@ pub fn uumain(args: impl uucore::Args) -> UResult<()> {
                 wanted.push(name);
             }
 
-            if !append {
-                for g in group_file.entries_mut() {
-                    g.members.retain(|m| m != login && m != member);
+            // -r drops the user from the listed groups only, -a adds it to them,
+            // and plain -G makes them the user's whole list.
+            let remove = matches.get_flag(options::REMOVE);
+            let update = |name: &str, members: &mut Vec<String>| {
+                let listed = wanted.iter().any(|w| w == name);
+                if (remove && listed) || (!remove && !append) {
+                    members.retain(|m| m != login && m != member);
                 }
-            }
-            for gname in &wanted {
-                if let Some(g) = group_file.find_mut(gname)
-                    && !g.members.iter().any(|m| m == member)
-                {
-                    g.members.push(member.clone());
+                if listed && !remove && !members.iter().any(|m| m == member) {
+                    members.push(member.clone());
                 }
+            };
+            for g in group_file.entries_mut() {
+                update(&g.name, &mut g.members);
             }
 
             // /etc/gshadow carries the same membership lists; leaving it
@@ -414,17 +418,8 @@ pub fn uumain(args: impl uucore::Args) -> UResult<()> {
                     LockedFile::<GshadowEntry>::open(&gshadow_path).map_err(|e| {
                         UsermodError::CantUpdateGroup(format!("cannot open gshadow: {e}"))
                     })?;
-                if !append {
-                    for g in gshadow_file.entries_mut() {
-                        g.members.retain(|m| m != login && m != member);
-                    }
-                }
-                for gname in &wanted {
-                    if let Some(g) = gshadow_file.find_mut(gname)
-                        && !g.members.iter().any(|m| m == member)
-                    {
-                        g.members.push(member.clone());
-                    }
+                for g in gshadow_file.entries_mut() {
+                    update(&g.name, &mut g.members);
                 }
                 files.push(Box::new(gshadow_file));
             }
@@ -637,6 +632,15 @@ pub fn uu_app() -> Command {
                 .action(ArgAction::SetTrue),
         )
         .arg(
+            Arg::new(options::REMOVE)
+                .short('r')
+                .long("remove")
+                .requires(options::GROUPS)
+                .conflicts_with(options::APPEND)
+                .help("Remove from the supplementary groups given with -G only")
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
             Arg::new(options::LOCK)
                 .short('L')
                 .long("lock")
@@ -778,6 +782,25 @@ mod tests {
         assert_eq!(
             m.get_one::<String>(options::GROUPS).map(String::as_str),
             Some("sudo,docker")
+        );
+    }
+
+    #[test]
+    fn test_remove_needs_groups_and_excludes_append() {
+        assert!(
+            uu_app()
+                .try_get_matches_from(["usermod", "-r", "-G", "sudo", "u"])
+                .is_ok()
+        );
+        assert!(
+            uu_app()
+                .try_get_matches_from(["usermod", "-r", "u"])
+                .is_err()
+        );
+        assert!(
+            uu_app()
+                .try_get_matches_from(["usermod", "-a", "-r", "-G", "sudo", "u"])
+                .is_err()
         );
     }
 

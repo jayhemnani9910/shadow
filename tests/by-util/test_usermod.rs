@@ -377,6 +377,26 @@ fn test_add_to_groups() {
 }
 
 #[test]
+fn test_remove_from_groups() {
+    if crate::common::skip_unless_root() {
+        return;
+    }
+
+    let dir = setup_prefix(
+        "testuser:x:1000:1000:Test:/home/testuser:/bin/bash\n",
+        "testuser:$6$hash:19500:0:99999:7:::\n",
+        "testuser:x:1000:\ngroup1:x:2001:testuser\ngroup2:x:2002:other,testuser\ngroup3:x:2003:testuser\n",
+    );
+
+    let code = run_with_prefix(&dir, &["-r", "-G", "group1,group2", "testuser"]);
+    assert_eq!(code, 0, "removing from supplementary groups should succeed");
+    assert_eq!(
+        read_group(&dir),
+        "testuser:x:1000:\ngroup1:x:2001:\ngroup2:x:2002:other\ngroup3:x:2003:testuser\n"
+    );
+}
+
+#[test]
 fn test_lock_user() {
     if crate::common::skip_unless_root() {
         return;
