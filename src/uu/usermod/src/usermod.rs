@@ -140,6 +140,15 @@ pub fn uumain(args: impl uucore::Args) -> UResult<()> {
         }
     }
 
+    // usermod(8) exit 3. A relative home would be resolved against the directory
+    // root runs this from. An empty one is allowed, like upstream: no home.
+    if matches
+        .get_one::<String>(options::HOME)
+        .is_some_and(|home| !home.is_empty() && !home.starts_with('/'))
+    {
+        return Err(UsermodError::BadArgument("homedir must be an absolute path".into()).into());
+    }
+
     // Subordinate id ranges are validated with the other arguments, before any
     // file is written; usermod(8) exits 3 for an invalid one.
     let subid_changes = parse_subid_changes(&matches)?;
@@ -168,11 +177,9 @@ pub fn uumain(args: impl uucore::Args) -> UResult<()> {
         return Err(UsermodError::UserNotFound(format!("user '{login}' does not exist")).into());
     };
 
-    // Save the old UID, GID and home dir before mutation so we can chown if needed.
+    // Save the old UID and GID before mutation so we can chown if needed.
     let old_uid = entries[idx].uid;
     let old_primary_gid = entries[idx].gid;
-    let home_for_chown = entries[idx].home.clone();
-    let home_is_changing = matches.get_one::<String>(options::HOME).is_some();
 
     // Check UID collision before mutating.
     if let Some(&uid) = matches.get_one::<u32>(options::UID) {
@@ -186,7 +193,10 @@ pub fn uumain(args: impl uucore::Args) -> UResult<()> {
         entries[idx].gecos.clone_from(c);
     }
     if let Some(h) = matches.get_one::<String>(options::HOME) {
-        entries[idx].home.clone_from(h);
+        // One trailing slash goes, as with upstream: a home that scripts compare
+        // should not depend on how the command line happened to spell it.
+        let h = h.strip_suffix('/').filter(|s| !s.is_empty()).unwrap_or(h);
+        h.clone_into(&mut entries[idx].home);
     }
     if let Some(s) = matches.get_one::<String>(options::SHELL) {
         entries[idx].shell.clone_from(s);
@@ -231,6 +241,7 @@ pub fn uumain(args: impl uucore::Args) -> UResult<()> {
 
     let new_uid = entries[idx].uid;
     let new_primary_gid = entries[idx].gid;
+    let home_for_chown = entries[idx].home.clone();
 
     passwd_file
         .commit()
@@ -239,14 +250,15 @@ pub fn uumain(args: impl uucore::Args) -> UResult<()> {
     // Restore signals before potentially long-running recursive chown.
     drop(signals);
 
-    // If the UID or the primary group changed and the home directory was not
-    // explicitly moved, recursively chown the existing home directory.
+    // If the UID or the primary group changed, recursively chown the home the
+    // account now has, which is the one -d gave if it gave one. A previous home
+    // stays as it is, like upstream: nothing was moved, and it may not be this
+    // user's to change any more.
     // usermod(8): only files owned by the old UID get the new UID, and only
     // files in the old primary group get the new group.
     // A home that cannot be re-owned is reported at the end, like upstream:
     // the account files are written regardless.
     let home_chown = if (new_uid != old_uid || new_primary_gid != old_primary_gid)
-        && !home_is_changing
         && !home_for_chown.is_empty()
     {
         rechown_home(
