@@ -721,6 +721,7 @@ struct CopyDir {
     dst: std::fs::File,
     /// Taken before the directory is read, which changes its access time.
     meta: std::fs::Metadata,
+    acl: Option<Vec<u8>>,
     /// The entries still to copy.
     names: Vec<std::ffi::CString>,
 }
@@ -728,11 +729,13 @@ struct CopyDir {
 impl CopyDir {
     fn open(src: std::fs::File, dst: std::fs::File) -> std::io::Result<Self> {
         let meta = src.metadata()?;
+        let acl = read_access_acl(&src)?;
         let names = list_names(&src)?;
         Ok(Self {
             src,
             dst,
             meta,
+            acl,
             names,
         })
     }
@@ -780,7 +783,7 @@ fn copy_tree(src: std::fs::File, dst: std::fs::File) -> std::io::Result<()> {
     while let Some(dir) = stack.last_mut() {
         let Some(name) = dir.names.pop() else {
             if let Some(done) = stack.pop() {
-                copy_attributes(&done.dst, &done.meta)?;
+                copy_attributes(&done.dst, &done.meta, done.acl.as_deref())?;
             }
             at.pop();
             continue;
@@ -841,7 +844,7 @@ fn copy_entry(
             Mode::from_raw_mode(0o600),
         )?);
         std::io::copy(&mut reader, &mut writer)?;
-        copy_attributes(&writer, &opened)?;
+        copy_attributes(&writer, &opened, read_access_acl(&reader)?.as_deref())?;
         opened
     } else if kind.is_fifo() || kind.is_char_device() || kind.is_block_device() {
         rustix::fs::mknodat(
@@ -854,8 +857,9 @@ fn copy_entry(
         copy_attributes_at(&dir.dst, name, &meta)?;
         meta
     } else {
-        // Sockets belong to a running process and cannot be copied.
-        return Ok(None);
+        // A socket belongs to a running process and cannot be copied. Refused
+        // like upstream: the old home stays whole, nothing is lost silently.
+        return Err(std::io::ErrorKind::Unsupported.into());
     };
     if meta.nlink() > 1 {
         links.insert((meta.dev(), meta.ino()), name_in_tree.to_path_buf());
@@ -911,9 +915,36 @@ fn timestamps_of(meta: &std::fs::Metadata) -> rustix::fs::Timestamps {
     }
 }
 
-/// Give the open `file` the owner, mode and times in `meta`. The mode is set
-/// after the owner, since chown(2) clears the set-user-ID and set-group-ID bits.
-fn copy_attributes(file: &std::fs::File, meta: &std::fs::Metadata) -> std::io::Result<()> {
+/// The extended attribute a POSIX access ACL is stored in. The default ACL of a
+/// directory is not kept, as with upstream.
+const ACCESS_ACL: &std::ffi::CStr = c"system.posix_acl_access";
+
+/// The access ACL of `file`, if it has one. An ACL has to move with the mode:
+/// its mask is stored in the group bits, so a file that kept its mode and lost
+/// its ACL gives the owning group what used to be only the mask.
+fn read_access_acl(file: &std::fs::File) -> std::io::Result<Option<Vec<u8>>> {
+    use rustix::io::Errno;
+
+    let len = match rustix::fs::fgetxattr_query(file, ACCESS_ACL) {
+        Ok(len) => len,
+        Err(Errno::NODATA | Errno::NOTSUP) => return Ok(None),
+        Err(e) => return Err(e.into()),
+    };
+    let mut acl = vec![0; len];
+    let len = rustix::fs::fgetxattr(file, ACCESS_ACL, &mut acl[..])?;
+    acl.truncate(len);
+    Ok(Some(acl))
+}
+
+/// Give the open `file` the owner, mode, ACL and times in `meta`. The mode is
+/// set after the owner, since chown(2) clears the set-user-ID and set-group-ID
+/// bits. A filesystem that cannot hold the ACL fails the copy, as carrying on
+/// without it widens what the file gives away.
+fn copy_attributes(
+    file: &std::fs::File,
+    meta: &std::fs::Metadata,
+    acl: Option<&[u8]>,
+) -> std::io::Result<()> {
     use rustix::fs::Mode;
     use rustix::process::{Gid, Uid};
     use std::os::unix::fs::MetadataExt;
@@ -924,6 +955,9 @@ fn copy_attributes(file: &std::fs::File, meta: &std::fs::Metadata) -> std::io::R
         Some(Gid::from_raw(meta.gid())),
     )?;
     rustix::fs::fchmod(file, Mode::from_raw_mode(meta.mode() & 0o7777))?;
+    if let Some(acl) = acl {
+        rustix::fs::fsetxattr(file, ACCESS_ACL, acl, rustix::fs::XattrFlags::empty())?;
+    }
     rustix::fs::futimens(file, &timestamps_of(meta))?;
     Ok(())
 }
@@ -1703,6 +1737,73 @@ mod tests {
         let copied = std::fs::metadata(new.join("sub")).expect("stat");
         assert_eq!(copied.atime(), 1_000_000_000);
         assert_eq!(copied.mtime(), 1_000_000_000);
+    }
+
+    /// An ACL's mask lives in the group bits of the mode. A file that lost its
+    /// ACL but kept its mode gives the owning group what only the mask was.
+    #[test]
+    fn test_copy_home_keeps_the_access_acl() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let src = tempfile::tempdir().expect("tempdir");
+        let file = src.path().join("f");
+        std::fs::write(&file, "x").expect("write");
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o640)).expect("chmod");
+        // user::rwx user:1234:r-- group::--- mask::r-- other::---
+        // The same for the directory, which its owner has to be able to enter.
+        let entry = |tag: u16, perm: u16, id: u32| {
+            [
+                tag.to_le_bytes().as_slice(),
+                perm.to_le_bytes().as_slice(),
+                id.to_le_bytes().as_slice(),
+            ]
+            .concat()
+        };
+        let acl = [
+            2u32.to_le_bytes().to_vec(),
+            entry(0x01, 7, u32::MAX),
+            entry(0x02, 4, 1234),
+            entry(0x04, 0, u32::MAX),
+            entry(0x10, 4, u32::MAX),
+            entry(0x20, 0, u32::MAX),
+        ]
+        .concat();
+        let set = |path: &Path| {
+            rustix::fs::setxattr(
+                path,
+                "system.posix_acl_access",
+                &acl,
+                rustix::fs::XattrFlags::empty(),
+            )
+        };
+        if set(&file).is_err() || set(src.path()).is_err() {
+            return; // No ACLs on this filesystem.
+        }
+        let parent = tempfile::tempdir().expect("tempdir");
+        let new = parent.path().join("new");
+
+        copy_home(src.path(), &new).expect("copy_home");
+
+        for path in [new.join("f"), new.clone()] {
+            let mut got = vec![0; acl.len() + 64];
+            let n = rustix::fs::getxattr(&path, "system.posix_acl_access", &mut got[..])
+                .expect("the ACL is there");
+            assert_eq!(&got[..n], &acl[..], "{}", path.display());
+        }
+    }
+
+    /// Ubuntu's usermod refuses the whole move over a socket, and leaves the
+    /// old home as it was. Dropping it and exiting 0 would lose it silently.
+    #[test]
+    fn test_copy_home_refuses_a_socket() {
+        let src = tempfile::tempdir().expect("tempdir");
+        let _socket = std::os::unix::net::UnixListener::bind(src.path().join("s")).expect("bind");
+        let parent = tempfile::tempdir().expect("tempdir");
+        let new = parent.path().join("new");
+
+        assert!(copy_home(src.path(), &new).is_err());
+        assert!(!new.exists(), "the partial copy is removed");
+        assert!(src.path().join("s").exists(), "the old home is left");
     }
 
     fn skip_unless_root() -> bool {
