@@ -174,8 +174,19 @@ pub fn uumain(args: impl uucore::Args) -> UResult<()> {
     let mut groups =
         LockedFile::<GroupEntry>::open(&group_path).map_err(cant_update(&group_path))?;
 
-    // gshadow is only touched by a rename or a password change.
-    let touches_gshadow = new_name.is_some() || new_password.is_some();
+    // groupmod(8) -U sets the member list; with -a the users are added to it.
+    let new_members: Option<Vec<String>> = matches.get_one::<String>(options::USERS).map(|users| {
+        users
+            .split(',')
+            .map(str::trim)
+            .filter(|u| !u.is_empty())
+            .map(ToOwned::to_owned)
+            .collect()
+    });
+    let append = matches.get_flag(options::APPEND);
+
+    // gshadow is only touched by a rename, a password change or new members.
+    let touches_gshadow = new_name.is_some() || new_password.is_some() || new_members.is_some();
     let mut gshadow = if gshadow_path.exists() && touches_gshadow {
         Some(LockedFile::<GshadowEntry>::open(&gshadow_path).map_err(cant_update(&gshadow_path))?)
     } else {
@@ -216,26 +227,12 @@ pub fn uumain(args: impl uucore::Args) -> UResult<()> {
         entries[idx].name.clone_from(name);
     }
 
-    // groupmod(8) -U sets the member list; with -a the users are added to it.
-    if let Some(users) = matches.get_one::<String>(options::USERS) {
-        let requested: Vec<String> = users
-            .split(',')
-            .map(str::trim)
-            .filter(|u| !u.is_empty())
-            .map(ToOwned::to_owned)
-            .collect();
-        for name in &requested {
+    if let Some(requested) = &new_members {
+        for name in requested {
             shadow_core::validate::validate_username(name)
                 .map_err(|e| GroupmodError::BadArgument(format!("invalid member name: {e}")))?;
         }
-        if !matches.get_flag(options::APPEND) {
-            entries[idx].members.clear();
-        }
-        for name in requested {
-            if !entries[idx].members.contains(&name) {
-                entries[idx].members.push(name);
-            }
-        }
+        set_members(&mut entries[idx].members, requested, append);
     }
 
     // Without a gshadow file the password belongs in the group file, which is
@@ -268,6 +265,9 @@ pub fn uumain(args: impl uucore::Args) -> UResult<()> {
         if let Some(pw) = new_password {
             gs.passwd.clone_from(pw);
         }
+        if let Some(requested) = &new_members {
+            set_members(&mut gs.members, requested, append);
+        }
     }
 
     // Every file is validated before any is written, so a value that would
@@ -288,6 +288,17 @@ pub fn uumain(args: impl uucore::Args) -> UResult<()> {
     audit::log_user_event("MOD_GROUP", group_name, modified_gid, true);
 
     Ok(())
+}
+
+fn set_members(members: &mut Vec<String>, requested: &[String], append: bool) {
+    if !append {
+        members.clear();
+    }
+    for name in requested {
+        if !members.contains(name) {
+            members.push(name.clone());
+        }
+    }
 }
 
 #[must_use]

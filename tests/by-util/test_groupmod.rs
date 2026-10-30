@@ -280,6 +280,32 @@ fn test_rename_updates_gshadow() {
     );
 }
 
+// groupmod(8) -U sets the members in gshadow too; only group was updated.
+#[test]
+fn test_users_update_gshadow() {
+    if crate::common::skip_unless_root() {
+        return;
+    }
+
+    let dir = setup_root(
+        "mygrp:x:2000:user1\n",
+        "mygrp:!::user1\n",
+        "root:x:0:0:root:/root:/bin/bash\n",
+    );
+
+    let prefix = dir.path().to_str().expect("temp dir path is valid UTF-8");
+    assert_eq!(run(&["groupmod", "-U", "user2", "-P", prefix, "mygrp"]), 0);
+    assert_eq!(read_group(&dir), "mygrp:x:2000:user2\n");
+    assert_eq!(read_gshadow(&dir), "mygrp:!::user2\n");
+
+    assert_eq!(
+        run(&["groupmod", "-a", "-U", "user3", "-P", prefix, "mygrp"]),
+        0
+    );
+    assert_eq!(read_group(&dir), "mygrp:x:2000:user2,user3\n");
+    assert_eq!(read_gshadow(&dir), "mygrp:!::user2,user3\n");
+}
+
 #[test]
 fn test_name_collision_fails() {
     if crate::common::skip_unless_root() {
