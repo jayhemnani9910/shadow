@@ -239,6 +239,12 @@ fn determine_gid(
         let gid: u32 = gid_str
             .parse()
             .map_err(|_| GroupaddError::BadArgument(format!("invalid GID '{gid_str}'")))?;
+        // u32::MAX is (gid_t)-1, the "no change" sentinel of chown/setresgid.
+        if gid == u32::MAX {
+            return Err(GroupaddError::BadArgument(format!(
+                "invalid GID '{gid_str}'"
+            )));
+        }
 
         if !non_unique && existing_groups.iter().any(|g| g.gid == gid) {
             if force {
