@@ -56,6 +56,7 @@ enum UsermodError {
     NameInUse(String),
     GroupNotFound(String),
     CantUpdateGroup(String),
+    CantChownHome(String),
 }
 
 impl fmt::Display for UsermodError {
@@ -67,7 +68,8 @@ impl fmt::Display for UsermodError {
             | Self::UidInUse(msg)
             | Self::NameInUse(msg)
             | Self::GroupNotFound(msg)
-            | Self::CantUpdateGroup(msg) => f.write_str(msg),
+            | Self::CantUpdateGroup(msg)
+            | Self::CantChownHome(msg) => f.write_str(msg),
         }
     }
 }
@@ -86,6 +88,8 @@ impl UError for UsermodError {
             Self::NameInUse(_) => 9,
             // usermod(8): 10 = can't update the group file.
             Self::CantUpdateGroup(_) => 10,
+            // usermod(8): 12 = unable to complete the home directory change.
+            Self::CantChownHome(_) => 12,
         }
     }
 }
@@ -118,7 +122,7 @@ pub fn uumain(args: impl uucore::Args) -> UResult<()> {
     }
 
     // Block signals for the passwd lock→write critical section only.
-    // Dropped before recursive_chown so long-running operations remain interruptible.
+    // Dropped before the home walk so long-running operations remain interruptible.
     let signals = shadow_core::hardening::SignalBlocker::block_critical()
         .map_err(|e| UsermodError::CantUpdate(format!("cannot block signals: {e}")))?;
 
@@ -239,23 +243,20 @@ pub fn uumain(args: impl uucore::Args) -> UResult<()> {
     // explicitly moved, recursively chown the existing home directory.
     // usermod(8): only files owned by the old UID get the new UID, and only
     // files in the old primary group get the new group.
-    if (new_uid != old_uid || new_primary_gid != old_primary_gid)
+    // A home that cannot be re-owned is reported at the end, like upstream:
+    // the account files are written regardless.
+    let home_chown = if (new_uid != old_uid || new_primary_gid != old_primary_gid)
         && !home_is_changing
         && !home_for_chown.is_empty()
     {
-        use std::os::unix::fs::MetadataExt;
-
-        // Like GNU, only a home directory the user owns is walked, and a
-        // symlinked home is not followed.
-        let home_path = root.resolve(&home_for_chown);
-        if std::fs::symlink_metadata(&home_path).is_ok_and(|m| m.is_dir() && m.uid() == old_uid) {
-            recursive_chown(
-                &home_path,
-                (old_uid, new_uid),
-                (old_primary_gid, new_primary_gid),
-            );
-        }
-    }
+        rechown_home(
+            &root.resolve(&home_for_chown),
+            (old_uid, new_uid),
+            (old_primary_gid, new_primary_gid),
+        )
+    } else {
+        Ok(())
+    };
 
     // Shadow modifications.
     let shadow_path = root.shadow_path();
@@ -434,9 +435,11 @@ pub fn uumain(args: impl uucore::Args) -> UResult<()> {
     nscd::invalidate_cache("passwd");
     nscd::invalidate_cache("group");
 
-    audit::log_user_event("MOD_USER", login, new_uid, true);
+    // The account files are written by now, but a home left behind means the
+    // change is incomplete; the log has to agree with the exit status.
+    audit::log_user_event("MOD_USER", login, new_uid, home_chown.is_ok());
 
-    Ok(())
+    home_chown.map_err(Into::into)
 }
 
 /// One requested change to `/etc/subuid` or `/etc/subgid`.
@@ -515,49 +518,239 @@ fn apply_subid_changes(
     Ok(())
 }
 
-/// Recursively chown all files and directories under `path`: those owned by
-/// the old UID get the new UID, and those whose group is the old GID get the
-/// new GID. Other owners and groups are left untouched.
+/// Re-own a home directory after a UID or primary group change: entries
+/// owned by the old UID get the new one, entries in the old group get the
+/// new group, anything else is left alone.
 ///
-/// Uses `fchownat` with `AT_SYMLINK_NOFOLLOW` so symlinks themselves are
-/// re-owned without following them.
-fn recursive_chown(path: &Path, owner: (u32, u32), group: (u32, u32)) {
-    if let Ok(entries) = std::fs::read_dir(path) {
-        for entry in entries.flatten() {
-            let entry_path = entry.path();
-            if let Ok(meta) = std::fs::symlink_metadata(&entry_path) {
-                chown_matching(&entry_path, &meta, owner, group);
-                if meta.is_dir() {
-                    recursive_chown(&entry_path, owner, group);
-                }
-            }
-        }
+/// Whether the home is the user's is decided through a symlink, like upstream.
+/// A home that is missing, a dangling link, or not the user's is left alone.
+/// One that is the user's is opened without following a link, however its path
+/// is spelled, and if that fails it is not walked: it is a symlink, or not a
+/// directory, or it vanished between the two calls, and upstream exits 12 in
+/// all three as well. If it was swapped between them for a directory that is
+/// not the user's, it is left alone.
+///
+/// The user owns the tree and can rename, replace or re-link entries in it
+/// while this runs as root, so the walk never resolves a path below `home`:
+/// each directory is opened relative to its parent's descriptor with
+/// `O_NOFOLLOW`, each other entry with `O_PATH | O_NOFOLLOW`, and the ownership
+/// test and the change both go through that one descriptor. A symlink swapped
+/// in mid-walk is re-owned itself and never followed, and the inode that was
+/// checked is the inode that changes. See [`HomeWalk::chown_matching`] for the
+/// one thing in the old group that keeps it.
+///
+/// Every entry is re-owned through the descriptor that found it, directories
+/// included, so a directory that cannot be opened still changes hands. Any
+/// failure to re-own, open or read does not stop the walk, unlike upstream; it
+/// becomes `CantChownHome`, exit 12, once the rest of the tree is done, and
+/// the caller raises that after the account files are written. This includes
+/// running out of descriptors on a tree deeper than the limit, where the part
+/// out of reach stays as it was. An entry deleted or replaced by the user
+/// mid-walk is not a failure: nothing can make a walk complete against someone
+/// changing the tree under it, and it has nothing left to re-own.
+fn rechown_home(home: &Path, owner: (u32, u32), group: (u32, u32)) -> Result<(), UsermodError> {
+    use std::rc::Rc;
+    use uucore::safe_traversal::{DirFd, SymlinkBehavior};
+
+    // O_NOFOLLOW only looks at the last component. In "home/" or "home/." that
+    // is not the link, so the kernel would resolve it and the walk would start
+    // wherever it points. components() drops those spellings.
+    let home: std::path::PathBuf = home.components().collect();
+
+    if !rustix::fs::stat(&home).is_ok_and(|st| st.st_uid == owner.0) {
+        return Ok(());
     }
-    // Also chown the directory itself.
-    if let Ok(meta) = std::fs::symlink_metadata(path) {
-        chown_matching(path, &meta, owner, group);
+    let Ok(top) = DirFd::open(&home, SymlinkBehavior::NoFollow) else {
+        return Err(cant_chown_home());
+    };
+    let Ok(top_stat) = rustix::fs::fstat(&top) else {
+        return Err(cant_chown_home());
+    };
+    // Swapped for something else since the check: not the user's any more.
+    if top_stat.st_uid != owner.0 {
+        return Ok(());
+    }
+
+    let mut walk = HomeWalk {
+        owner,
+        group,
+        complete: true,
+    };
+    walk.chown_matching(&top, &top_stat);
+
+    // Directories still to read, by name under a parent held open. A parent
+    // stays open only while children of it wait, so the descriptors held
+    // follow the depth of the tree, not its width, and nothing recurses.
+    let mut pending: Vec<(Rc<DirFd>, std::ffi::OsString)> = Vec::new();
+    walk.queue_entries(&Rc::new(top), &mut pending);
+    while let Some((parent, name)) = pending.pop() {
+        let dir = match parent.open_subdir(&name, SymlinkBehavior::NoFollow) {
+            Ok(dir) => dir,
+            Err(e) => {
+                use rustix::io::Errno;
+                match Errno::from_io_error(&e) {
+                    // Deleted since it was listed: the user may do that.
+                    Some(Errno::NOENT) => {}
+                    // Replaced by something that is not a directory, again the
+                    // user's own doing. What is there now is re-owned and not
+                    // followed; there is nothing to walk.
+                    Some(Errno::NOTDIR | Errno::LOOP) => {
+                        walk.reown_entry(&parent, &name);
+                    }
+                    _ => walk.complete = false,
+                }
+                continue;
+            }
+        };
+        drop(parent);
+        // Already re-owned when it was found, unless the name now holds a
+        // directory that was swapped in since.
+        let Ok(st) = rustix::fs::fstat(&dir) else {
+            walk.complete = false;
+            continue;
+        };
+        walk.chown_matching(&dir, &st);
+        walk.queue_entries(&Rc::new(dir), &mut pending);
+    }
+
+    if walk.complete {
+        Ok(())
+    } else {
+        Err(cant_chown_home())
     }
 }
 
-/// Give `path` the new UID if it has the old one, and the new GID if it has
-/// the old one.
-fn chown_matching(path: &Path, meta: &std::fs::Metadata, owner: (u32, u32), group: (u32, u32)) {
-    use std::os::unix::fs::MetadataExt;
+/// The same message for every way of leaving the home behind, as the only
+/// thing the caller can do about it is look at the home.
+fn cant_chown_home() -> UsermodError {
+    UsermodError::CantChownHome("Failed to change ownership of the home directory".into())
+}
 
-    let (old_owner, new_owner) = owner;
-    let (old_group, new_group) = group;
-    let set_owner = (old_owner != new_owner && meta.uid() == old_owner)
-        .then(|| rustix::process::Uid::from_raw(new_owner));
-    let set_group = (old_group != new_group && meta.gid() == old_group)
-        .then(|| rustix::process::Gid::from_raw(new_group));
-    if set_owner.is_some() || set_group.is_some() {
-        let _ = rustix::fs::chownat(
-            rustix::fs::CWD,
-            path,
+/// One run over a home. A failure does not stop it, the rest of the tree is
+/// still the user's; it is remembered in `complete` and reported at the end.
+struct HomeWalk {
+    owner: (u32, u32),
+    group: (u32, u32),
+    complete: bool,
+}
+
+impl HomeWalk {
+    /// Re-own every entry of `dir`, and queue the directories to be walked.
+    fn queue_entries(
+        &mut self,
+        dir: &std::rc::Rc<uucore::safe_traversal::DirFd>,
+        pending: &mut Vec<(
+            std::rc::Rc<uucore::safe_traversal::DirFd>,
+            std::ffi::OsString,
+        )>,
+    ) {
+        for name in self.read_names(dir) {
+            if self.reown_entry(dir, &name) {
+                pending.push((std::rc::Rc::clone(dir), name));
+            }
+        }
+    }
+
+    /// The names in `dir`, as many as could be read.
+    ///
+    /// `DirFd::read_dir` needs a second descriptor, so it fails outright at the
+    /// descriptor limit, and it drops what it read if a later read fails. This
+    /// needs none, and whatever came back is still re-owned.
+    fn read_names(&mut self, dir: &uucore::safe_traversal::DirFd) -> Vec<std::ffi::OsString> {
+        use rustix::io::Errno;
+        use std::os::unix::ffi::OsStrExt;
+
+        let mut buf = [std::mem::MaybeUninit::uninit(); 8192];
+        let mut entries = rustix::fs::RawDir::new(dir, &mut buf);
+        let mut names = Vec::new();
+        while let Some(entry) = entries.next() {
+            match entry {
+                Ok(entry) => {
+                    let name = entry.file_name();
+                    if name != c"." && name != c".." {
+                        names.push(std::ffi::OsStr::from_bytes(name.to_bytes()).to_owned());
+                    }
+                }
+                // The directory was deleted while it was being read.
+                Err(Errno::NOENT) => break,
+                Err(_) => {
+                    self.complete = false;
+                    break;
+                }
+            }
+        }
+        names
+    }
+
+    /// Re-own the entry `name` of `dir` through a descriptor of its own, and
+    /// say whether it is a directory. A directory is re-owned here too, before
+    /// it is opened: one that cannot be opened then still changes hands, and
+    /// this descriptor never followed anything to get to it.
+    fn reown_entry(&mut self, dir: &uucore::safe_traversal::DirFd, name: &std::ffi::OsStr) -> bool {
+        use rustix::fs::{FileType, Mode, OFlags};
+        use rustix::io::Errno;
+
+        let entry = match rustix::fs::openat(
+            dir,
+            name,
+            OFlags::PATH | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        ) {
+            Ok(entry) => entry,
+            // Deleted since it was listed: the user may do that.
+            Err(Errno::NOENT) => return false,
+            Err(_) => {
+                self.complete = false;
+                return false;
+            }
+        };
+        let Ok(st) = rustix::fs::fstat(&entry) else {
+            self.complete = false;
+            return false;
+        };
+        self.chown_matching(&entry, &st);
+        FileType::from_raw_mode(st.st_mode) == FileType::Directory
+    }
+
+    /// Give the file behind `fd` the new UID if it has the old one, and the new
+    /// GID if it has the old one. `st` is the `fstat` of this same descriptor,
+    /// so the inode checked is the inode changed. `fd` may be an `O_PATH`
+    /// descriptor, so the change goes through `fchownat` with `AT_EMPTY_PATH`,
+    /// which works on one and, for a symlink, changes the link itself.
+    ///
+    /// Unlike upstream, the group of a hard link to someone else's file is left
+    /// alone. The user can link a file they can write into their home, and it
+    /// is one inode: regrouping this name regroups the file where its owner
+    /// keeps it, and can take it away from the people its mode was for. A file
+    /// the user owns is theirs however many names it has, so it changes as any
+    /// other does, with `-g` alone too: skipping those would leave the hard
+    /// links every backup tree and package store is full of in the old group.
+    fn chown_matching(&mut self, fd: impl rustix::fd::AsFd, st: &rustix::fs::Stat) {
+        use rustix::fs::FileType;
+
+        let (old_owner, new_owner) = self.owner;
+        let (old_group, new_group) = self.group;
+        let someone_elses_link = st.st_nlink > 1
+            && st.st_uid != old_owner
+            && FileType::from_raw_mode(st.st_mode) != FileType::Directory;
+        let set_owner = (old_owner != new_owner && st.st_uid == old_owner)
+            .then(|| rustix::process::Uid::from_raw(new_owner));
+        let set_group = (old_group != new_group && st.st_gid == old_group && !someone_elses_link)
+            .then(|| rustix::process::Gid::from_raw(new_group));
+        if set_owner.is_none() && set_group.is_none() {
+            return;
+        }
+        match rustix::fs::chownat(
+            &fd,
+            c"",
             set_owner,
             set_group,
-            rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
-        );
+            rustix::fs::AtFlags::EMPTY_PATH,
+        ) {
+            // ENOENT: deleted after it was opened, the user may do that.
+            Ok(()) | Err(rustix::io::Errno::NOENT) => {}
+            Err(_) => self.complete = false,
+        }
     }
 }
 

@@ -332,10 +332,23 @@ fn test_home_not_owned_by_user_is_left_alone() {
             }
 
             let code = run_with_prefix(&dir, &[args[0], args[1], "testuser"]);
-            // GNU exits 12 for a symlinked home: #351.
-            if !symlinked {
-                assert_eq!(code, 0, "{args:?} should succeed");
-            }
+            // GNU: a home that is the user's through a symlink is not walked,
+            // and that is exit 12, with /etc/passwd written all the same.
+            assert_eq!(
+                code,
+                if symlinked { 12 } else { 0 },
+                "{args:?}, symlinked {symlinked}"
+            );
+            let passwd = read_passwd(&dir);
+            let expected = if args[0] == "-u" {
+                "testuser:x:1500:1000:"
+            } else {
+                "testuser:x:1000:2000:"
+            };
+            assert!(
+                passwd.contains(expected),
+                "{args:?}, symlinked {symlinked}: {passwd}"
+            );
             assert_eq!(
                 owner_of(&real),
                 (real_owner, 1000),
@@ -807,4 +820,642 @@ fn test_rename_with_groups_uses_the_new_login() {
         gshadow.contains("wheel:!::bob"),
         "gshadow must follow the group file, got: {gshadow}"
     );
+}
+
+/// The user owns the home and can swap entries while root walks it. Here a
+/// thread keeps exchanging subdirectories with symlinks to a directory
+/// outside the home, atomically, for the whole run. A walk that checks an
+/// entry by path and then opens it by path can be steered through the link
+/// and re-own the file outside; the walk must never touch it.
+#[test]
+fn test_rechown_never_follows_an_entry_swapped_mid_walk() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    const PAIRS: usize = 32;
+
+    if crate::common::skip_unless_root() {
+        return;
+    }
+
+    for round in 0..40 {
+        let dir = setup_prefix(
+            "testuser:x:1000:1000:Test:/home/testuser:/bin/bash\n",
+            "testuser:$6$hash:19500:0:99999:7:::\n",
+            "testuser:x:1000:\n",
+        );
+        let home = dir.path().join("home/testuser");
+        let outside = dir.path().join("outside");
+        std::fs::create_dir_all(&outside).expect("failed to create outside dir");
+        std::fs::write(outside.join("victim"), "").expect("failed to write victim");
+        std::os::unix::fs::chown(outside.join("victim"), Some(1000), Some(1000))
+            .expect("chown failed");
+        std::fs::create_dir_all(&home).expect("failed to create home");
+        for i in 0..PAIRS {
+            let sub = home.join(format!("d{i}"));
+            std::fs::create_dir(&sub).expect("failed to create subdir");
+            std::fs::write(sub.join("f"), "").expect("failed to write file");
+            std::os::unix::fs::symlink(&outside, home.join(format!("l{i}")))
+                .expect("failed to create symlink");
+        }
+        // Entries the swapper does not touch, to see the walk really walked.
+        std::fs::create_dir(home.join("keep")).expect("failed to create subdir");
+        std::fs::write(home.join("keep/f"), "").expect("failed to write file");
+        std::fs::write(home.join("plain"), "").expect("failed to write file");
+        // chown -R by hand: everything in the home is the user's.
+        for entry in std::fs::read_dir(&home).expect("read home") {
+            let path = entry.expect("entry").path();
+            std::os::unix::fs::lchown(&path, Some(1000), Some(1000)).expect("chown failed");
+            if path.is_dir() && !path.is_symlink() {
+                std::os::unix::fs::chown(path.join("f"), Some(1000), Some(1000))
+                    .expect("chown failed");
+            }
+        }
+        std::os::unix::fs::chown(&home, Some(1000), Some(1000)).expect("chown failed");
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let swapper = {
+            let stop = Arc::clone(&stop);
+            let home = home.clone();
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    for i in 0..PAIRS {
+                        let _ = rustix::fs::renameat_with(
+                            rustix::fs::CWD,
+                            home.join(format!("d{i}")),
+                            rustix::fs::CWD,
+                            home.join(format!("l{i}")),
+                            rustix::fs::RenameFlags::EXCHANGE,
+                        );
+                    }
+                }
+            })
+        };
+        let code = run_with_prefix(&dir, &["-u", "1500", "testuser"]);
+        stop.store(true, Ordering::Relaxed);
+        swapper.join().expect("swapper thread panicked");
+
+        assert_eq!(code, 0, "round {round}: changing the UID should succeed");
+        assert_eq!(
+            owner_of(&outside.join("victim")),
+            (1000, 1000),
+            "round {round}: a file outside the home was re-owned through a swapped symlink"
+        );
+        assert_eq!(
+            owner_of(&outside),
+            (0, 0),
+            "round {round}: outside dir re-owned"
+        );
+        // Never following anything is easy for a walk that does nothing.
+        for path in [
+            home.clone(),
+            home.join("keep"),
+            home.join("keep/f"),
+            home.join("plain"),
+        ] {
+            assert_eq!(
+                owner_of(&path),
+                (1500, 1000),
+                "round {round}: {} not re-owned",
+                path.display()
+            );
+        }
+    }
+}
+
+/// GNU decides whether the home is the user's through a symlink. A home the
+/// user owns that cannot be walked without following a link, or that is not
+/// a directory, is exit 12; a home that is not the user's, missing, or a
+/// dangling link, is left alone with exit 0.
+#[test]
+fn test_rechown_home_that_cannot_be_walked() {
+    if crate::common::skip_unless_root() {
+        return;
+    }
+
+    // (setup, expected exit code)
+    let cases: [(&str, i32); 4] = [
+        ("regular file owned by the user", 12),
+        ("symlink to a root-owned directory", 0),
+        ("dangling symlink", 0),
+        ("missing", 0),
+    ];
+    for (case, expected) in cases {
+        let dir = setup_prefix(
+            "testuser:x:1000:1000:Test:/home/testuser:/bin/bash\n",
+            "testuser:$6$hash:19500:0:99999:7:::\n",
+            "testuser:x:1000:\n",
+        );
+        let home = dir.path().join("home/testuser");
+        std::fs::create_dir_all(dir.path().join("home")).expect("failed to create /home");
+        match case {
+            "regular file owned by the user" => {
+                std::fs::write(&home, "").expect("failed to write file");
+                std::os::unix::fs::chown(&home, Some(1000), Some(1000)).expect("chown failed");
+            }
+            "symlink to a root-owned directory" => {
+                let real = dir.path().join("real");
+                std::fs::create_dir(&real).expect("failed to create dir");
+                std::os::unix::fs::symlink(&real, &home).expect("failed to create symlink");
+            }
+            "dangling symlink" => {
+                std::os::unix::fs::symlink(dir.path().join("nowhere"), &home)
+                    .expect("failed to create symlink");
+            }
+            _ => {}
+        }
+        let code = run_with_prefix(&dir, &["-u", "1500", "testuser"]);
+        assert_eq!(code, expected, "home is a {case}");
+        assert!(
+            read_passwd(&dir).contains("testuser:x:1500:"),
+            "home is a {case}: /etc/passwd should be updated"
+        );
+    }
+}
+
+/// Listens on `/dev/log` for the life of a test, and removes it afterwards.
+///
+/// Sending to a full datagram socket blocks, and every test in this process
+/// that logs sends to this one while it exists, this test's own `usermod`
+/// included. So a thread keeps it drained the whole time.
+struct SyslogListener {
+    lines: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    reader: Option<std::thread::JoinHandle<()>>,
+}
+
+impl SyslogListener {
+    const PATH: &'static str = "/dev/log";
+
+    /// `None` where a real syslog daemon already owns the socket: taking it
+    /// over would lose that daemon's log, and its messages cannot be read here.
+    fn bind() -> Option<Self> {
+        use std::sync::atomic::Ordering;
+
+        if std::fs::symlink_metadata(Self::PATH).is_ok() {
+            return None;
+        }
+        let socket = std::os::unix::net::UnixDatagram::bind(Self::PATH).expect("bind /dev/log");
+        socket
+            .set_read_timeout(Some(std::time::Duration::from_millis(50)))
+            .expect("set timeout");
+        let lines = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let reader = {
+            let lines = std::sync::Arc::clone(&lines);
+            let stop = std::sync::Arc::clone(&stop);
+            std::thread::spawn(move || {
+                let mut buf = [0u8; 2048];
+                while !stop.load(Ordering::Relaxed) {
+                    if let Ok(n) = socket.recv(&mut buf) {
+                        lines
+                            .lock()
+                            .expect("lines lock")
+                            .push(String::from_utf8_lossy(&buf[..n]).into_owned());
+                    }
+                }
+            })
+        };
+        Some(Self {
+            lines,
+            stop,
+            reader: Some(reader),
+        })
+    }
+
+    /// The first line about `login`. Tests run in parallel in this process and
+    /// log too, so lines about other accounts are expected here.
+    fn line_about(&self, login: &str) -> String {
+        let needle = format!("acct=\"{login}\"");
+        for _ in 0..1000 {
+            let lines = self.lines.lock().expect("lines lock");
+            if let Some(line) = lines.iter().find(|line| line.contains(&needle)) {
+                return line.clone();
+            }
+            drop(lines);
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        panic!("no syslog line about {login}");
+    }
+}
+
+impl Drop for SyslogListener {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        if let Some(reader) = self.reader.take() {
+            let _ = reader.join();
+        }
+        let _ = std::fs::remove_file(Self::PATH);
+    }
+}
+
+/// The account files are written either way, but a home that could not be
+/// re-owned means the change did not complete, and exit 12 says so: the audit
+/// trail must not record the same run as a success.
+#[test]
+fn test_audit_records_a_failed_home_rechown_as_failed() {
+    if crate::common::skip_unless_root() {
+        return;
+    }
+    let Some(listener) = SyslogListener::bind() else {
+        return;
+    };
+
+    let setup = |login: &str| {
+        let dir = setup_prefix(
+            &format!("{login}:x:1000:1000:Test:/home/{login}:/bin/bash\n"),
+            &format!("{login}:$6$hash:19500:0:99999:7:::\n"),
+            &format!("{login}:x:1000:\n"),
+        );
+        std::fs::create_dir_all(dir.path().join("home")).expect("failed to create /home");
+        dir
+    };
+
+    // A symlinked home is the user's and is not walked: exit 12.
+    let dir = setup("auditfail");
+    let real = dir.path().join("real");
+    std::fs::create_dir(&real).expect("failed to create dir");
+    std::os::unix::fs::chown(&real, Some(1000), Some(1000)).expect("chown failed");
+    std::os::unix::fs::symlink(&real, dir.path().join("home/auditfail"))
+        .expect("failed to create symlink");
+    assert_eq!(run_with_prefix(&dir, &["-u", "1500", "auditfail"]), 12);
+    let line = listener.line_about("auditfail");
+    assert!(line.contains("res=failed"), "{line}");
+
+    // The same change on a home that can be walked.
+    let dir = setup("auditok");
+    let home = dir.path().join("home/auditok");
+    std::fs::create_dir(&home).expect("failed to create home");
+    std::os::unix::fs::chown(&home, Some(1000), Some(1000)).expect("chown failed");
+    assert_eq!(run_with_prefix(&dir, &["-u", "1500", "auditok"]), 0);
+    let line = listener.line_about("auditok");
+    assert!(line.contains("res=success"), "{line}");
+}
+
+/// `O_NOFOLLOW` only looks at the last component, and with a trailing slash
+/// that component is empty: the kernel resolves a symlink before it. A home
+/// spelled with one must not reach the walk through a link that the same home
+/// spelled without one is refused for.
+#[test]
+fn test_rechown_trailing_slash_on_a_symlinked_home() {
+    if crate::common::skip_unless_root() {
+        return;
+    }
+
+    for spelling in ["testuser", "testuser/", "testuser//", "testuser/."] {
+        let dir = setup_prefix(
+            &format!("testuser:x:1000:1000:Test:/home/{spelling}:/bin/bash\n"),
+            "testuser:$6$hash:19500:0:99999:7:::\n",
+            "testuser:x:1000:\n",
+        );
+        let real = dir.path().join("real");
+        std::fs::create_dir(&real).expect("failed to create dir");
+        std::fs::write(real.join("file"), "").expect("failed to write file");
+        std::os::unix::fs::chown(real.join("file"), Some(1000), Some(1000)).expect("chown failed");
+        std::os::unix::fs::chown(&real, Some(1000), Some(1000)).expect("chown failed");
+        std::fs::create_dir_all(dir.path().join("home")).expect("failed to create /home");
+        std::os::unix::fs::symlink(&real, dir.path().join("home/testuser"))
+            .expect("failed to create symlink");
+
+        let code = run_with_prefix(&dir, &["-u", "1500", "testuser"]);
+        assert_eq!(code, 12, "home spelled {spelling}");
+        assert_eq!(owner_of(&real), (1000, 1000), "home spelled {spelling}");
+        assert_eq!(
+            owner_of(&real.join("file")),
+            (1000, 1000),
+            "home spelled {spelling}"
+        );
+        assert!(
+            read_passwd(&dir).contains("testuser:x:1500:"),
+            "home spelled {spelling}: /etc/passwd should be updated"
+        );
+    }
+
+    // The real directory reached with a trailing slash is walked as usual.
+    let dir = setup_prefix(
+        "testuser:x:1000:1000:Test:/home/testuser/:/bin/bash\n",
+        "testuser:$6$hash:19500:0:99999:7:::\n",
+        "testuser:x:1000:\n",
+    );
+    let home = dir.path().join("home/testuser");
+    std::fs::create_dir_all(&home).expect("failed to create home");
+    std::fs::write(home.join("file"), "").expect("failed to write file");
+    std::os::unix::fs::chown(home.join("file"), Some(1000), Some(1000)).expect("chown failed");
+    std::os::unix::fs::chown(&home, Some(1000), Some(1000)).expect("chown failed");
+    assert_eq!(run_with_prefix(&dir, &["-u", "1500", "testuser"]), 0);
+    assert_eq!(owner_of(&home), (1500, 1000));
+    assert_eq!(owner_of(&home.join("file")), (1500, 1000));
+}
+
+/// Run `usermod` on a thread of its own with `dropped` removed from the
+/// effective capabilities, which are per thread. Root otherwise gets past every
+/// permission check, and the failures a walk has to survive cannot be made.
+fn run_without_capabilities(
+    dir: &tempfile::TempDir,
+    args: &[&str],
+    dropped: rustix::thread::CapabilitySet,
+) -> i32 {
+    std::thread::scope(|scope| {
+        scope
+            .spawn(|| {
+                let mut caps = rustix::thread::capabilities(None).expect("capget failed");
+                caps.effective.remove(dropped);
+                rustix::thread::set_capabilities(None, caps).expect("capset failed");
+                run_with_prefix(dir, args)
+            })
+            .join()
+            .expect("usermod thread panicked")
+    })
+}
+
+/// A home holding a directory root cannot open once it has no way around the
+/// mode: `blocked` is mode 000, with `inner` in it, next to `plain` and
+/// `open/f`.
+fn home_with_a_blocked_directory(dir: &tempfile::TempDir) -> std::path::PathBuf {
+    use std::os::unix::fs::{PermissionsExt, chown};
+
+    let home = dir.path().join("home/testuser");
+    let blocked = home.join("blocked");
+    std::fs::create_dir_all(&blocked).expect("failed to create blocked");
+    std::fs::create_dir(home.join("open")).expect("failed to create open");
+    for file in [
+        blocked.join("inner"),
+        home.join("plain"),
+        home.join("open/f"),
+    ] {
+        std::fs::write(&file, "").expect("failed to write file");
+        chown(&file, Some(1000), Some(1000)).expect("chown failed");
+    }
+    for path in [&blocked, &home.join("open"), &home] {
+        chown(path, Some(1000), Some(1000)).expect("chown failed");
+    }
+    std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o000))
+        .expect("chmod failed");
+    home
+}
+
+/// A directory the walk cannot open cannot be walked, but it can still be
+/// re-owned through the descriptor that found it, which needs no permission
+/// on the directory and follows nothing.
+#[test]
+fn test_rechown_reowns_a_directory_it_cannot_open() {
+    use rustix::thread::CapabilitySet;
+
+    if crate::common::skip_unless_root() {
+        return;
+    }
+
+    let dir = setup_prefix(
+        "testuser:x:1000:1000:Test:/home/testuser:/bin/bash\n",
+        "testuser:$6$hash:19500:0:99999:7:::\n",
+        "testuser:x:1000:\n",
+    );
+    let home = home_with_a_blocked_directory(&dir);
+
+    let code = run_without_capabilities(
+        &dir,
+        &["-u", "1500", "testuser"],
+        CapabilitySet::DAC_OVERRIDE | CapabilitySet::DAC_READ_SEARCH,
+    );
+
+    assert_eq!(code, 12, "a directory was not walked, and that must show");
+    assert!(read_passwd(&dir).contains("testuser:x:1500:"));
+    assert_eq!(owner_of(&home.join("blocked")), (1500, 1000));
+    assert_eq!(
+        owner_of(&home.join("blocked/inner")),
+        (1000, 1000),
+        "the walk could not have reached this"
+    );
+    assert_eq!(owner_of(&home), (1500, 1000));
+    assert_eq!(owner_of(&home.join("plain")), (1500, 1000));
+    assert_eq!(owner_of(&home.join("open")), (1500, 1000));
+    assert_eq!(owner_of(&home.join("open/f")), (1500, 1000));
+}
+
+/// A change that fails is reported, but does not stop the walk. Without
+/// `CAP_CHOWN` root can still move a file it owns to a group it is in, and
+/// nothing else: the home and `theirs` fail, whatever order the walk finds
+/// them in, while `ours` and `ours-dir/f` change.
+#[test]
+fn test_rechown_keeps_walking_after_a_chown_fails() {
+    use rustix::thread::CapabilitySet;
+    use std::os::unix::fs::chown;
+
+    if crate::common::skip_unless_root() {
+        return;
+    }
+
+    let dir = setup_prefix(
+        "testuser:x:1000:1000:Test:/home/testuser:/bin/bash\n",
+        "testuser:$6$hash:19500:0:99999:7:::\n",
+        "root:x:0:\ntestuser:x:1000:\n",
+    );
+    let home = dir.path().join("home/testuser");
+    std::fs::create_dir_all(home.join("ours-dir")).expect("failed to create dirs");
+    for (path, uid) in [
+        ("ours", 0),
+        ("ours-dir/f", 0),
+        ("theirs", 1000),
+        ("ours-dir/theirs", 1000),
+    ] {
+        std::fs::write(home.join(path), "").expect("failed to write file");
+        chown(home.join(path), Some(uid), Some(1000)).expect("chown failed");
+    }
+    chown(home.join("ours-dir"), Some(0), Some(1000)).expect("chown failed");
+    chown(&home, Some(1000), Some(1000)).expect("chown failed");
+
+    let code = run_without_capabilities(&dir, &["-g", "0", "testuser"], CapabilitySet::CHOWN);
+
+    assert_eq!(code, 12);
+    assert!(read_passwd(&dir).contains("testuser:x:1000:0:"));
+    assert_eq!(owner_of(&home), (1000, 1000));
+    assert_eq!(owner_of(&home.join("theirs")), (1000, 1000));
+    assert_eq!(owner_of(&home.join("ours-dir/theirs")), (1000, 1000));
+    assert_eq!(owner_of(&home.join("ours")), (0, 0));
+    assert_eq!(owner_of(&home.join("ours-dir")), (0, 0));
+    assert_eq!(owner_of(&home.join("ours-dir/f")), (0, 0));
+}
+
+/// Running out of descriptors on a deep tree must not look like success. A
+/// parent stays open while siblings of the next level wait, so depth is what
+/// uses them up; the real binary runs under a low limit, as the limit is per
+/// process. `d` is created first and the siblings are named per level, so the
+/// order `d` is reached in differs through the tree on every filesystem.
+#[test]
+fn test_rechown_at_the_descriptor_limit_exits_12() {
+    use std::os::unix::fs::{MetadataExt, chown};
+
+    const DEPTH: usize = 200;
+
+    if crate::common::skip_unless_root() {
+        return;
+    }
+
+    let dir = setup_prefix(
+        "testuser:x:1000:1000:Test:/home/testuser:/bin/bash\n",
+        "testuser:$6$hash:19500:0:99999:7:::\n",
+        "testuser:x:1000:\n",
+    );
+    let home = dir.path().join("home/testuser");
+    let mut level = home.clone();
+    std::fs::create_dir_all(&level).expect("failed to create home");
+    chown(&level, Some(1000), Some(1000)).expect("chown failed");
+    for i in 0..DEPTH {
+        let next = level.join("d");
+        std::fs::create_dir(&next).expect("failed to create chain");
+        chown(&next, Some(1000), Some(1000)).expect("chown failed");
+        for sibling in ["a", "b", "c"] {
+            let sibling = level.join(format!("{sibling}{i}"));
+            std::fs::create_dir(&sibling).expect("failed to create sibling");
+            chown(&sibling, Some(1000), Some(1000)).expect("chown failed");
+            std::fs::write(sibling.join("f"), "").expect("failed to write file");
+            chown(sibling.join("f"), Some(1000), Some(1000)).expect("chown failed");
+        }
+        level = next;
+    }
+    std::fs::write(level.join("bottom"), "").expect("failed to write file");
+    chown(level.join("bottom"), Some(1000), Some(1000)).expect("chown failed");
+
+    let out = crate::common::run_cmd(
+        std::process::Command::new("sh")
+            .args(["-c", "ulimit -n 20; exec \"$0\" \"$@\""])
+            .arg(env!("CARGO_BIN_EXE_shadow-rs"))
+            .args(["usermod", "-P"])
+            .arg(dir.path())
+            .args(["-u", "1500", "testuser"]),
+    );
+    out.assert_code(12)
+        .assert_stderr_contains("Failed to change ownership of the home directory");
+    assert!(read_passwd(&dir).contains("testuser:x:1500:"));
+
+    // What the limit did not stop was still done: the shallow part is all
+    // re-owned, and the deep part really was out of reach.
+    assert_eq!(owner_of(&home), (1500, 1000));
+    assert_eq!(owner_of(&home.join("a0/f")), (1500, 1000));
+    assert_eq!(owner_of(&home.join("b0/f")), (1500, 1000));
+    assert_eq!(owner_of(&home.join("c0/f")), (1500, 1000));
+    assert_eq!(
+        std::fs::symlink_metadata(level.join("bottom"))
+            .expect("stat failed")
+            .uid(),
+        1000,
+        "exit 12 with nothing left behind would be wrong"
+    );
+}
+
+/// The user may delete their own files while root walks the home. What was
+/// deleted needs no new owner, so that is not a failure.
+#[test]
+fn test_rechown_entries_deleted_mid_walk_are_not_a_failure() {
+    use std::os::unix::fs::chown;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    const DIRS: usize = 64;
+    const FILES: usize = 16;
+
+    if crate::common::skip_unless_root() {
+        return;
+    }
+
+    for round in 0..20 {
+        let dir = setup_prefix(
+            "testuser:x:1000:1000:Test:/home/testuser:/bin/bash\n",
+            "testuser:$6$hash:19500:0:99999:7:::\n",
+            "testuser:x:1000:\n",
+        );
+        let home = dir.path().join("home/testuser");
+        std::fs::create_dir_all(&home).expect("failed to create home");
+        chown(&home, Some(1000), Some(1000)).expect("chown failed");
+        for d in 0..DIRS {
+            let sub = home.join(format!("d{d}"));
+            std::fs::create_dir(&sub).expect("failed to create dir");
+            chown(&sub, Some(1000), Some(1000)).expect("chown failed");
+            for f in 0..FILES {
+                let file = sub.join(format!("f{f}"));
+                std::fs::write(&file, "").expect("failed to write file");
+                chown(&file, Some(1000), Some(1000)).expect("chown failed");
+            }
+        }
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let deleter = {
+            let stop = Arc::clone(&stop);
+            let home = home.clone();
+            std::thread::spawn(move || {
+                let mut d = 0;
+                while !stop.load(Ordering::Relaxed) && d < DIRS {
+                    let _ = std::fs::remove_dir_all(home.join(format!("d{d}")));
+                    d += 1;
+                }
+            })
+        };
+        let code = run_with_prefix(&dir, &["-u", "1500", "testuser"]);
+        stop.store(true, Ordering::Relaxed);
+        deleter.join().expect("deleter thread panicked");
+
+        assert_eq!(code, 0, "round {round}");
+        assert_eq!(owner_of(&home), (1500, 1000), "round {round}");
+    }
+}
+
+/// A hard link in the home to a file of someone else is that person's file,
+/// whatever group it is in. Both names are the same inode, so regrouping it
+/// here regroups it where its owner keeps it. The user's own hard links, in the
+/// home or out of it, are the user's files and change as any other does.
+#[test]
+fn test_rechown_leaves_the_group_of_someone_elses_hard_link() {
+    use std::os::unix::fs::chown;
+
+    if crate::common::skip_unless_root() {
+        return;
+    }
+
+    // (args, what the user's own link becomes, what the other link stays at)
+    let cases: [(&[&str], (u32, u32)); 3] = [
+        (&["-g", "dev"], (1000, 2000)),
+        (&["-u", "1500", "-g", "dev"], (1500, 2000)),
+        (&["-u", "1500"], (1500, 1000)),
+    ];
+    for (args, own_expected) in cases {
+        let dir = setup_prefix(
+            "testuser:x:1000:1000:Test:/home/testuser:/bin/bash\n",
+            "testuser:$6$hash:19500:0:99999:7:::\n",
+            "testuser:x:1000:\ndev:x:2000:\n",
+        );
+        let home = dir.path().join("home/testuser");
+        let outside = dir.path().join("outside");
+        std::fs::create_dir_all(&home).expect("failed to create home");
+        std::fs::create_dir_all(&outside).expect("failed to create outside");
+        chown(&home, Some(1000), Some(1000)).expect("chown failed");
+
+        // Someone else's file, in the user's old group, linked into the home.
+        std::fs::write(outside.join("theirs"), "").expect("failed to write file");
+        chown(outside.join("theirs"), Some(1100), Some(1000)).expect("chown failed");
+        std::fs::hard_link(outside.join("theirs"), home.join("theirs")).expect("link failed");
+        // The user's own file, with a second name.
+        std::fs::write(outside.join("mine"), "").expect("failed to write file");
+        chown(outside.join("mine"), Some(1000), Some(1000)).expect("chown failed");
+        std::fs::hard_link(outside.join("mine"), home.join("mine")).expect("link failed");
+        // Someone else's file with one name is still regrouped: it was moved
+        // into the home, and this is the only place it is reachable from.
+        std::fs::write(home.join("given"), "").expect("failed to write file");
+        chown(home.join("given"), Some(1100), Some(1000)).expect("chown failed");
+
+        assert_eq!(
+            run_with_prefix(&dir, &[args, &["testuser"]].concat()),
+            0,
+            "{args:?}"
+        );
+
+        assert_eq!(owner_of(&home.join("theirs")), (1100, 1000), "{args:?}");
+        assert_eq!(owner_of(&outside.join("theirs")), (1100, 1000), "{args:?}");
+        assert_eq!(owner_of(&home.join("mine")), own_expected, "{args:?}");
+        let given = if args.contains(&"-g") {
+            (1100, 2000)
+        } else {
+            (1100, 1000)
+        };
+        assert_eq!(owner_of(&home.join("given")), given, "{args:?}");
+    }
 }
